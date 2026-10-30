@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "saintchris.super-productivity",
+  "name": "Super Productivity",
+  "version": "0.1.0",
+  "author": "Alex Bogle (SaintChris)",
+  "description": "Current Super Productivity task and today's time in the bar, with start and stop",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "Super Productivity",
+    "description": "Current task and today's time, read from the app's local REST API",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "port": 3876,
+      "tokenFile": "~/.config/superProductivity/local-rest-api-token",
+      "launchCommand": "superproductivity",
+      "maxWidth": 220
+    },
+    "schema": [
+      { "key": "port", "type": "number", "label": "REST API port" },
+      { "key": "tokenFile", "type": "string", "label": "API token file" },
+      { "key": "launchCommand", "type": "string", "label": "Command that starts the app" },
+      { "key": "maxWidth", "type": "number", "label": "Longest task title in the bar (px)" }
+    ]
+  }
+}
