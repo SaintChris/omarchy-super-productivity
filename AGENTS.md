@@ -7,7 +7,7 @@ An Omarchy shell bar widget (`Widget.qml`, `manifest.json`) that shows and contr
 - Launcher check, as CI runs it from `launcher/`: `cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked && cargo doc --no-deps --locked`
 - Launcher install: `cd launcher && cargo build --release --locked && install -m 755 target/release/sp-launch ~/.local/bin/`
 - Widget check (CI does not cover the widget): `omarchy plugin validate "$PWD"`
-- The installed widget is its own git clone in `~/.config/omarchy/plugins/saintchris.super-productivity`, so edits here never reach the bar. After a merge, run `omarchy plugin update saintchris.super-productivity`.
+- Where the widget is installed decides how edits reach the bar. A normal `omarchy plugin add` install is its own clone in `~/.config/omarchy/plugins/saintchris.super-productivity`; after a merge, update it with `omarchy plugin update saintchris.super-productivity`. A development install where that folder is a symlink to this checkout is live on save (a save there reloads the bar); don't run `omarchy plugin update` against it, because it fast-forwards this checkout.
 
 ## Rules agents get wrong
 
