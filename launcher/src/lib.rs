@@ -158,13 +158,14 @@ impl Store {
         }
         fs::create_dir(&staging).context("can't create the staging folder")?;
         // The runtime unpacks into ./squashfs-root, so run it inside the staging folder.
-        let status = Command::new(appimage)
+        let mut extract = Command::new(appimage);
+        extract
             .arg("--appimage-extract")
             .current_dir(&staging)
             .env_remove("ELECTRON_RUN_AS_NODE")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .status()
+            .stdout(Stdio::null());
+        let status = retry_if_busy(|| extract.status())
             .with_context(|| format!("can't run {}", appimage.display()))?;
         let root = staging.join("squashfs-root");
         if !status.success() || !root.join("AppRun").is_file() {
@@ -291,7 +292,7 @@ impl Store {
 /// # Errors
 /// Fails when the command can't be started or exits non-zero within `grace`.
 pub fn launch(mut cmd: Command, grace: Duration) -> Result<u32> {
-    let mut child = cmd.spawn().context("can't start Super Productivity")?;
+    let mut child = retry_if_busy(|| cmd.spawn()).context("can't start Super Productivity")?;
     let pid = child.id();
     let deadline = Instant::now() + grace;
     while Instant::now() < deadline {
@@ -304,6 +305,22 @@ pub fn launch(mut cmd: Command, grace: Duration) -> Result<u32> {
         std::thread::sleep(Duration::from_millis(100));
     }
     Ok(pid)
+}
+
+/// Run `f` again for a moment while it fails with "Text file busy": the file was
+/// just written (an AppImage still being copied, or a write in another thread
+/// whose descriptor a concurrent fork still holds).
+fn retry_if_busy<T>(mut f: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut tries = 0;
+    loop {
+        match f() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 50 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            other => return other,
+        }
+    }
 }
 
 /// Lowercase hex sha256 of a file.
@@ -574,7 +591,7 @@ mod tests {
         // shows the canonical path under real/.
         let sleep = store.versions_dir().join(&v).join("sleep");
         fs::copy("/bin/sleep", &sleep).unwrap();
-        let mut child = Command::new(&sleep).arg("5").spawn().unwrap();
+        let mut child = retry_if_busy(|| Command::new(&sleep).arg("5").spawn()).unwrap();
         let found = store.versions_in_use();
         child.kill().unwrap();
         let _ = child.wait();
