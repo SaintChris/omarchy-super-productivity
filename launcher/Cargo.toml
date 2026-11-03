@@ -1,0 +1,27 @@
+[package]
+name = "sp-launch"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.1"
+description = "Run Super Productivity's AppImage from an unpacked copy, so the app no longer dies with whatever started it"
+license = "MIT"
+repository = "https://github.com/SaintChris/omarchy-super-productivity"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+sha2 = "0.11.1"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+strip = true
