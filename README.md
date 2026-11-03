@@ -36,6 +36,8 @@ The widget lands on the right of the bar. Move it with `omarchy bar move saintch
    o.launch_on_start("superproductivity")
    ```
 
+   For an AppImage, start it through `sp-launch` instead (see below).
+
 ## Settings
 
 The defaults suit a standard install. Change them with `omarchy bar set`:
@@ -47,12 +49,29 @@ The defaults suit a standard install. Change them with `omarchy bar set`:
 | `launchCommand` | `superproductivity` | Command that starts the app (AppImage path, Flatpak command and so on) |
 | `maxWidth` | `220` | Longest task title in the bar, in pixels |
 
-For example, for an AppImage with its own data folder:
+For example, for an AppImage with its own data folder, started through `sp-launch` (below):
 
 ```bash
-omarchy bar set saintchris.super-productivity launchCommand "$HOME/Applications/Super-Productivity.AppImage --user-data-dir=$HOME/.config/sp-work"
+omarchy bar set saintchris.super-productivity launchCommand "$HOME/.local/bin/sp-launch start -- --user-data-dir=$HOME/.config/sp-work"
 omarchy bar set saintchris.super-productivity tokenFile "~/.config/sp-work/local-rest-api-token"
 ```
+
+## Running the AppImage: `sp-launch`
+
+Started straight from an AppImage, Super Productivity can die with SIGBUS long after it started. The AppImage's runtime serves the app's files from a FUSE mount and stays in the systemd scope of whatever started it (Hyprland's autostart, a terminal, an agent's shell). When that scope ends (Hyprland crashes, a reboot, the terminal closes) the mount disappears and the app is killed in the middle of whatever it was doing. Electron moves its main process into a scope of its own, but the helpers it starts first (zygote, Wayland idle helper) stay behind, so even an unpacked copy crashes (SIGTRAP) when the starter's scope is stopped.
+
+`launcher/` is a small Rust tool that fixes both:
+
+- `sp-launch install <AppImage>` unpacks the AppImage once into `~/.local/share/sp-launch/versions/<sha256 prefix>/` and points `current` at it. It keeps the previous version for rollback and never deletes one a running process uses.
+- `sp-launch start -- <app arguments>` runs the current version's `AppRun` in a new systemd user scope, with `ELECTRON_RUN_AS_NODE` and the AppImage variables removed, so the app outlives whatever started it. If the app is already running, it hands the request to the running copy and quits, as usual.
+- `sp-launch status` shows the installed version and each running copy, and flags one still running from an AppImage mount.
+
+```bash
+cd launcher && cargo build --release --locked && install -m 755 target/release/sp-launch ~/.local/bin/
+sp-launch install ~/Applications/Super-Productivity.AppImage
+```
+
+Then use `sp-launch start -- <arguments>` in `autostart.lua`, in `launchCommand` and in any desktop entry. Run `sp-launch install` again after each new AppImage; a running copy keeps its version until it restarts. To roll back, point the link at the kept version: `ln -sfn versions/<previous> ~/.local/share/sp-launch/current`.
 
 ## License
 
