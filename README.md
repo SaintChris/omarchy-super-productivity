@@ -73,6 +73,19 @@ sp-launch install ~/Applications/Super-Productivity.AppImage
 
 Then use `sp-launch start -- <arguments>` in `autostart.lua`, in `launchCommand` and in any desktop entry. Run `sp-launch install` again after each new AppImage; a running copy keeps its version until it restarts. To roll back, point the link at the kept version: `ln -sfn versions/<previous> ~/.local/share/sp-launch/current`.
 
+### Getting an AppImage built elsewhere: `sp-fetch`
+
+Building Super Productivity takes several GB of memory and most of an hour, so a laptop can leave it to another machine and fetch the result. `scripts/sp-fetch` reads a folder on that machine over SSH, checks the AppImage against its sha256 and installs it with `sp-launch install`:
+
+```bash
+install -m 755 scripts/sp-fetch ~/.local/bin/
+sp-fetch <ssh host> <folder> --check       # what the build machine has
+sp-fetch <ssh host> <folder>               # fetch, check, sp-launch install
+sp-fetch <ssh host> <folder> --no-install  # fetch and check only
+```
+
+The folder holds the AppImage (`superProductivity-arm64-<commit>.AppImage`), `latest.sha256` (one `sha256sum` line naming it) and `latest.txt` (branch, commit, build time). The AppImage lands in `~/Applications` (or `SP_FETCH_DEST`), and the two newest are kept. A running copy keeps its version until it restarts.
+
 ## License
 
 MIT

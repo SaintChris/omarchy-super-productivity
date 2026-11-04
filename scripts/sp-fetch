@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# sp-fetch: get a Super Productivity AppImage that another machine built, check its sha256, and
+# install it with `sp-launch install`. For a laptop that should never build the app itself.
+#
+#   sp-fetch <ssh host> <folder>              fetch the newest AppImage, check it, sp-launch install it
+#   sp-fetch <ssh host> <folder> --no-install fetch and check only
+#   sp-fetch <ssh host> <folder> --check      show what the build machine has; fetch nothing
+#
+# <folder> on the build machine holds, as written by the build:
+#   latest.sha256   one `sha256sum` line: <hash>  superProductivity-arm64-<commit>.AppImage
+#   latest.txt      branch, commit and build time (shown, not trusted)
+#   the AppImage named in latest.sha256
+# The AppImage is saved to SP_FETCH_DEST (default ~/Applications) under its own name, read over
+# `ssh <host> cat` and checked against latest.sha256 before it is moved into place. The two newest
+# fetched AppImages are kept. Installing doesn't touch a running copy: it keeps its version until
+# it restarts (`sp-launch status` shows both).
+set -euo pipefail
+usage() { sed -n '5,7p' "$0" | sed 's/^# *//' >&2; exit 2; }
+[ $# -ge 2 ] || usage
+host=$1 dir=$2 mode=${3:-install}
+case $mode in install | --no-install | --check) ;; *) usage ;; esac
+dest=${SP_FETCH_DEST:-$HOME/Applications}
+
+line=$(ssh "$host" cat "$dir/latest.sha256")
+read -r hash name <<< "$line"
+[[ $hash =~ ^[0-9a-f]{64}$ ]] || { echo "unexpected latest.sha256 on $host: $line" >&2; exit 1; }
+[[ $name =~ ^superProductivity-arm64-[0-9a-f]{7,40}\.AppImage$ ]] || { echo "unexpected AppImage name: $name" >&2; exit 1; }
+echo "$host has $name"
+ssh "$host" cat "$dir/latest.txt" | sed 's/^/  /'
+[ "$mode" = --check ] && exit 0
+
+mkdir -p "$dest"
+target=$dest/$name
+if [ -f "$target" ] && [ "$(sha256sum "$target" | cut -d' ' -f1)" = "$hash" ]; then
+  echo "already here: $target"
+else
+  part=$target.part
+  trap 'rm -f "$part"' EXIT
+  ssh "$host" cat "$dir/$name" > "$part"
+  got=$(sha256sum "$part" | cut -d' ' -f1)
+  [ "$got" = "$hash" ] || { echo "sha256 mismatch: got $got, $host says $hash; nothing installed" >&2; exit 1; }
+  chmod 755 "$part"
+  mv "$part" "$target"
+  trap - EXIT
+  echo "fetched and checked: $target"
+fi
+# Keep the two newest fetched AppImages.
+find "$dest" -maxdepth 1 -name 'superProductivity-arm64-*.AppImage' -printf '%T@ %p\n' | sort -rn | tail -n +3 | cut -d' ' -f2- |
+  while read -r old; do [ "$old" = "$target" ] || rm -f -- "$old"; done
+
+if [ "$mode" = install ]; then
+  sp-launch install "$target"
+  echo "installed; restart Super Productivity to run it (sp-launch status shows what runs now)"
+fi
