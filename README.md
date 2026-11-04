@@ -86,6 +86,41 @@ sp-fetch <ssh host> <folder> --no-install  # fetch and check only
 
 The folder holds the AppImage (`superProductivity-arm64-<commit>.AppImage`), `latest.sha256` (one `sha256sum` line naming it) and `latest.txt` (branch, commit, build time). The AppImage lands in `~/Applications` (or `SP_FETCH_DEST`), and the two newest are kept. A running copy keeps its version until it restarts.
 
+### Following a build automatically: `sp-update`
+
+`scripts/sp-update` is the unattended form of `sp-fetch`. A systemd user timer runs it at 08:00, 14:00 and 20:00 local time, and again two minutes after login. A newer AppImage is downloaded and checked against its sha256 as soon as the timer runs. That download does not change which version launches. `current` stays put until a later run both installs and starts the new build.
+
+That run waits until the desktop has been idle, or until the session is still in its first minutes after login. It then does the switch in one go: quit Super Productivity, back up the profile, `sp-launch install`, start the app, and check that the local API on `127.0.0.1` is up and the same projects and tasks are present. The backup is taken after the app has quit, because that is the copy a rollback restores. An overnight reboot keeps running the version already installed.
+
+The backup is the profile directory without the browser caches, plus the newest `backups/*.json` the app wrote. Five dated copies are kept. If the backup fails, nothing is installed. If the new version does not come up, or projects or tasks are missing, `sp-update` points `current` back at the previous version, restores that backup and starts the previous version. Sync settings are copied with the profile and are not edited.
+
+Each install, skipped install or failure sends one ntfy message. The topic is the contents of the file named by `SP_UPDATE_NTFY_TOPIC_FILE`. It is not stored in this repo. Set `SP_UPDATE_NTFY_SINK` to a path to record the message locally instead of sending it. A missed run while the machine was asleep happens the next time the timer starts. The timer does not hold up login. The first start can catch up a calendar slot that already passed; that run still installs only when the desktop is idle or the session just started.
+
+```bash
+install -m 755 scripts/sp-update ~/.local/bin/
+install -m 644 systemd/sp-update.service systemd/sp-update.timer ~/.config/systemd/user/
+```
+
+Settings are a `KEY=value` file, `~/.config/sp-update/config` (mode `0600`), or the same names in the environment. A variable that is already set wins over the file.
+
+```
+SP_UPDATE_HOST=example
+SP_UPDATE_DIR=/srv/super-productivity
+SP_UPDATE_DATA_DIR=$HOME/.config/sp-work
+SP_UPDATE_NTFY_TOPIC_FILE=$HOME/.config/sp-update/ntfy-topic
+SP_UPDATE_START_ARGS=--user-data-dir=$HOME/.config/sp-work --rest-api-port=3876
+```
+
+`SP_UPDATE_START_ARGS` is used when the app is not running, and it has to name the same profile as `SP_UPDATE_DATA_DIR`. When the app is running, the arguments of that process are used instead.
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now sp-update.timer
+sp-update --check
+```
+
+`sp-update --check` only compares the delivered build with the installed one.
+
 ## License
 
 MIT

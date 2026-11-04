@@ -1,0 +1,748 @@
+#!/usr/bin/env bash
+# Exercises scripts/sp-update against temp directories and PATH fakes.
+# A live Super Productivity, if one is running when this starts, must still be running at the end.
+set -euo pipefail
+umask 077
+
+ROOT=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
+SCRIPT=$ROOT/scripts/sp-update
+WORKDIR=$(mktemp -d)
+FAKEBIN=$WORKDIR/bin
+FAKE_PIDS=$WORKDIR/pids
+APP=$WORKDIR/appimage
+COMMIT=aaaaaaa
+BUILT=2026-11-04T08:42:03-05:00
+APP_NAME=superProductivity-arm64-aaaaaaa.AppImage
+OLD_VERSION=oldversion000000
+OLD_SHA=$(python3 -c 'print("2" * 64)')
+PROFILE_JSON='{"task":{"ids":["t1","t2"]},"project":{"ids":["p1"]},"globalConfig":{"sync":{"isEnabled":false,"encryptKey":"secret-marker"}}}'
+live_pids=()
+real_link=
+STATUS=0
+SPAWNED=
+CASE=
+DATA=
+STATE=
+LAUNCH=
+DEST=
+REMOTE=
+SINK=
+APP_SHA=
+NEW_VER=
+
+fail() {
+  printf '%s\n' "FAIL $*" >&2
+  if [[ -n ${CASE:-} && -f $CASE/out ]]; then
+    printf '%s\n' '--- stdout ---' >&2
+    cat "$CASE/out" >&2
+    printf '%s\n' '--- stderr ---' >&2
+    cat "$CASE/err" >&2
+  fi
+  exit 1
+}
+
+capture_live() {
+  local pid_path pid cmd0
+  for pid_path in /proc/[0-9]*; do
+    pid=${pid_path#/proc/}
+    [[ -r $pid_path/cmdline ]] || continue
+    cmd0=
+    IFS= read -r -d '' cmd0 <"$pid_path/cmdline" || true
+    [[ -n $cmd0 ]] || continue
+    [[ $(basename "$cmd0") == superproductivity-bin ]] || continue
+    live_pids+=("$pid")
+  done
+  if [[ -L $HOME/.local/share/sp-launch/current ]]; then
+    real_link=$(readlink "$HOME/.local/share/sp-launch/current")
+  fi
+}
+
+verify_live() {
+  local pid cmd0
+  for pid in "${live_pids[@]}"; do
+    [[ -r /proc/$pid/cmdline ]] || return 1
+    cmd0=
+    IFS= read -r -d '' cmd0 <"/proc/$pid/cmdline" || true
+    [[ $(basename "$cmd0") == superproductivity-bin ]] || return 1
+  done
+  if [[ -n $real_link ]]; then
+    [[ $(readlink "$HOME/.local/share/sp-launch/current") == "$real_link" ]] || return 1
+  fi
+}
+
+kill_fakes() {
+  local pid cmd skip live
+  [[ -f $FAKE_PIDS ]] || return 0
+  while IFS= read -r pid; do
+    [[ $pid =~ ^[0-9]+$ ]] || continue
+    [[ -r /proc/$pid/cmdline ]] || continue
+    skip=0
+    for live in "${live_pids[@]}"; do
+      if [[ $pid == "$live" ]]; then
+        skip=1
+      fi
+    done
+    [[ $skip == 0 ]] || continue
+    cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline")
+    case $cmd in
+      superproductivity-bin*"$WORKDIR"*) kill -KILL "$pid" 2>/dev/null || true ;;
+    esac
+  done <"$FAKE_PIDS"
+  : >"$FAKE_PIDS"
+}
+
+finish() {
+  local rc=$?
+  kill_fakes || true
+  if ! verify_live; then
+    printf 'live Super Productivity or its installed version changed\n' >&2
+    rc=1
+  fi
+  if [[ $rc == 0 ]]; then
+    rm -rf "$WORKDIR"
+  else
+    printf 'left %s\n' "$WORKDIR" >&2
+  fi
+  exit "$rc"
+}
+
+write_fakes() {
+  mkdir -p "$FAKEBIN"
+  : >"$FAKE_PIDS"
+  cat >"$FAKEBIN/ssh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -f ${FAKE_REMOTE}/offline ]]; then
+  exit 1
+fi
+path=
+prev=
+for arg in "$@"; do
+  if [[ $prev == cat ]]; then
+    path=$arg
+  fi
+  prev=$arg
+done
+[[ -n $path ]] || exit 1
+base=$(basename "$path")
+[[ -f ${FAKE_REMOTE}/$base ]] || exit 1
+cat "${FAKE_REMOTE}/$base"
+EOF
+  cat >"$FAKEBIN/sp-fetch" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+read -r _hash name <"${FAKE_REMOTE}/latest.sha256"
+mkdir -p "${SP_FETCH_DEST:?}"
+printf 'fetch\n' >>"${FAKE_LOG:?}"
+if [[ -f ${FAKE_REMOTE}/bad-download ]]; then
+  printf 'not the appimage\n' >"${SP_FETCH_DEST}/$name"
+else
+  cp "${FAKE_APPIMAGE:?}" "${SP_FETCH_DEST}/$name"
+fi
+EOF
+  cat >"$FAKEBIN/sp-launch" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cmd=${1:?}
+shift
+root=${SP_LAUNCH_ROOT:?}
+case $cmd in
+  install)
+    file=${1:?}
+    hash=$(sha256sum "$file" | awk '{ print $1; exit }')
+    ver=${hash:0:16}
+    mkdir -p "$root/versions/$ver"
+    printf '#!/bin/sh\nexit 0\n' >"$root/versions/$ver/AppRun"
+    chmod 755 "$root/versions/$ver/AppRun"
+    printf '%s  %s\n' "$hash" "$file" >"$root/versions/$ver/.sp-launch-source"
+    ln -s "versions/$ver" "$root/current.new"
+    mv -Tf "$root/current.new" "$root/current"
+    printf 'install %s\n' "$ver" >>"${FAKE_LOG:?}"
+    ;;
+  start)
+    if [[ ${1:-} == -- ]]; then
+      shift
+    fi
+    printf 'start\n' >>"${FAKE_LOG:?}"
+    ver=$(basename "$(readlink "$root/current")")
+    if [[ $ver != "${OLD_VERSION:?}" ]]; then
+      printf 'after\n' >"${SP_UPDATE_DATA_DIR:?}/profile-marker"
+      mkdir -p "${SP_UPDATE_DATA_DIR}/Migration"
+      printf 'new\n' >"${SP_UPDATE_DATA_DIR}/Migration/state"
+    fi
+    code='import time; time.sleep(3600)'
+    python3 -c 'import os, sys
+pid = os.fork()
+if pid > 0:
+    with open(sys.argv[3], "a", encoding="utf-8") as handle:
+        handle.write(str(pid) + "\n")
+    os._exit(0)
+os.setsid()
+os.execv("/usr/bin/python3", ["superproductivity-bin", "-c", sys.argv[2], "--user-data-dir=" + sys.argv[1], "--rest-api-port=9"])' \
+      "$SP_UPDATE_DATA_DIR" "$code" "${FAKE_PIDS:?}"
+    ;;
+  *)
+    printf 'unknown %s\n' "$cmd" >&2
+    exit 1
+    ;;
+esac
+EOF
+  cat >"$FAKEBIN/wayland-idle-helper" <<'EOF'
+#!/usr/bin/env bash
+printf 'ready\n'
+if [[ ${FAKE_IDLE:-} == yes ]]; then
+  printf 'idle\n'
+fi
+EOF
+  cat >"$FAKEBIN/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+method=GET
+outfile=
+url=
+prev=
+for arg in "$@"; do
+  case ${prev} in
+    -X) method=$arg ;;
+    -o) outfile=$arg ;;
+    -H) ;;
+  esac
+  case $arg in
+    http://*|https://*) url=$arg ;;
+  esac
+  prev=$arg
+done
+[[ $method == GET ]] || exit 1
+[[ $url == http://127.0.0.1:* ]] || exit 1
+port_path=${url#http://127.0.0.1:}
+port=${port_path%%/*}
+path=/${port_path#*/}
+[[ $port != 3876 && $port != 3877 ]] || exit 1
+body=
+case $path in
+  /health)
+    if [[ ${FAKE_HEALTH:-ok} == fail ]]; then
+      exit 1
+    fi
+    body=ok
+    ;;
+  /projects)
+    body='{"ok":true,"data":[{"id":"p1"}]}'
+    ;;
+  /tasks\?*)
+    body='{"ok":true,"data":[{"id":"t1"},{"id":"t2"}]}'
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+if [[ -n $outfile ]]; then
+  printf '%s' "$body" >"$outfile"
+else
+  printf '%s' "$body"
+fi
+EOF
+  chmod 755 "$FAKEBIN/ssh" "$FAKEBIN/sp-fetch" "$FAKEBIN/sp-launch" "$FAKEBIN/wayland-idle-helper" "$FAKEBIN/curl"
+}
+
+setup_case() {
+  kill_fakes
+  CASE=$WORKDIR/case
+  rm -rf "$CASE"
+  DATA=$CASE/profile
+  STATE=$CASE/state
+  LAUNCH=$CASE/launch
+  DEST=$CASE/dest
+  REMOTE=$CASE/remote
+  SINK=$CASE/sink
+  mkdir -p "$DATA/IndexedDB" "$DATA/backups" "$DATA/Cache" "$DATA/Code Cache" \
+    "$STATE" "$LAUNCH/versions/$OLD_VERSION" "$DEST" "$REMOTE"
+  printf 'junk\n' >"$DATA/Cache/junk"
+  printf 'x\n' >"$DATA/Code Cache/x"
+  printf 'keep\n' >"$DATA/.keep"
+  printf 'tok\n' >"$DATA/local-rest-api-token"
+  printf 'before\n' >"$DATA/profile-marker"
+  printf 'secret-marker\n' >"$DATA/sync-marker"
+  cp "$DATA/sync-marker" "$CASE/sync-orig"
+  printf '%s\n' "$PROFILE_JSON" >"$DATA/backups/2026-11-04_000000.json"
+  cp "$DATA/backups/2026-11-04_000000.json" "$CASE/json-orig"
+  printf '#!/bin/sh\nexit 0\n' >"$LAUNCH/versions/$OLD_VERSION/AppRun"
+  chmod 755 "$LAUNCH/versions/$OLD_VERSION/AppRun"
+  printf '%s  %s\n' "$OLD_SHA" "$APP" >"$LAUNCH/versions/$OLD_VERSION/.sp-launch-source"
+  ln -s "versions/$OLD_VERSION" "$LAUNCH/current"
+  printf '%s  %s\n' "$APP_SHA" "$APP_NAME" >"$REMOTE/latest.sha256"
+  printf 'branch test\ncommit %s\nbuilt %s\n' "$COMMIT" "$BUILT" >"$REMOTE/latest.txt"
+  : >"$CASE/log"
+  export SP_UPDATE_STATE_DIR=$STATE
+  export SP_UPDATE_DATA_DIR=$DATA
+  export SP_UPDATE_FETCH_DEST=$DEST
+  export SP_LAUNCH_ROOT=$LAUNCH
+  export SP_UPDATE_HOST=build-host
+  export SP_UPDATE_DIR=/delivery
+  export SP_UPDATE_NTFY_SINK=$SINK
+  export SP_UPDATE_CONFIG=$WORKDIR/empty-config
+  export SP_UPDATE_START_ARGS="--user-data-dir=$DATA --rest-api-port=9 --start-minimized"
+  export SP_UPDATE_SESSION_AGE_SEC=99999
+  export SP_UPDATE_LOGIN_WINDOW=900
+  export SP_UPDATE_HEALTH_TRIES=1
+  export SP_UPDATE_QUIT_WAIT=3
+  export SP_UPDATE_IDLE_MS=120000
+  export FAKE_REMOTE=$REMOTE
+  export FAKE_APPIMAGE=$APP
+  export FAKE_LOG=$CASE/log
+  export FAKE_PIDS
+  export FAKE_IDLE=no
+  export OLD_VERSION
+  unset FAKE_HEALTH
+  unset SP_UPDATE_NTFY_TOPIC_FILE
+}
+
+run_update() {
+  case ${SP_UPDATE_DATA_DIR:-} in
+    "$WORKDIR"/*) ;;
+    *) fail "data dir is not under the work dir" ;;
+  esac
+  case ${SP_LAUNCH_ROOT:-} in
+    "$WORKDIR"/*) ;;
+    *) fail "launch root is not under the work dir" ;;
+  esac
+  case ${SP_UPDATE_FETCH_DEST:-} in
+    "$WORKDIR"/*) ;;
+    *) fail "fetch dest is not under the work dir" ;;
+  esac
+  case ${SP_UPDATE_STATE_DIR:-} in
+    "$WORKDIR"/*) ;;
+    *) fail "state dir is not under the work dir" ;;
+  esac
+  STATUS=0
+  "$SCRIPT" "$@" >"$CASE/out" 2>"$CASE/err" || STATUS=$?
+}
+
+assert_status() {
+  [[ $STATUS == "$1" ]] || fail "status $STATUS expected $1"
+}
+
+assert_current() {
+  local got
+  got=$(basename "$(readlink "$LAUNCH/current")")
+  [[ $got == "$1" ]] || fail "current is $got expected $1"
+}
+
+assert_log() {
+  grep -q -e "$1" "$FAKE_LOG" || fail "missing log: $1"
+}
+
+assert_not_logged() {
+  if [[ -f $FAKE_LOG ]] && grep -q -e "$1" "$FAKE_LOG"; then
+    fail "unexpected log: $1"
+  fi
+}
+
+message_count() {
+  local n=0
+  if [[ -s ${SINK:-} ]]; then
+    n=$(awk 'END { print NR }' "$SINK")
+    n=$((n / 2))
+  fi
+  printf '%s\n' "$n"
+}
+
+assert_messages() {
+  local n
+  n=$(message_count)
+  [[ $n == "$1" ]] || fail "ntfy count $n expected $1"
+}
+
+assert_ntfy() {
+  local priority=$1 body=$2 got_p got_b
+  [[ -f $SINK ]] || fail "no ntfy"
+  got_p=$(awk 'NR==1 { print; exit }' "$SINK")
+  got_b=$(awk 'NR==2 { print; exit }' "$SINK")
+  [[ $got_p == "$priority" ]] || fail "ntfy priority $got_p expected $priority"
+  [[ $got_b == "$body" ]] || fail "ntfy body mismatch"
+}
+
+assert_sync_kept() {
+  cmp -s "$CASE/sync-orig" "$DATA/sync-marker" || fail "live sync marker changed"
+}
+
+one_backup() {
+  local dir n=0 found=
+  for dir in "$STATE/backups"/*; do
+    [[ -d $dir && -f $dir/complete ]] || continue
+    n=$((n + 1))
+    found=$dir
+  done
+  [[ $n == 1 ]] || fail "backup count $n"
+  printf '%s\n' "$found"
+}
+
+spawn_app() {
+  local mode=${1:-die} code pid i cmd0
+  case $DATA in
+    "$WORKDIR"/*) ;;
+    *) fail "refusing to spawn outside the work dir" ;;
+  esac
+  if [[ $mode == stubborn ]]; then
+    code='import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(3600)'
+  else
+    code='import time; time.sleep(3600)'
+  fi
+  python3 -c 'import os, sys
+pid = os.fork()
+if pid > 0:
+    with open(sys.argv[3], "a", encoding="utf-8") as handle:
+        handle.write(str(pid) + "\n")
+    os._exit(0)
+os.setsid()
+os.execv("/usr/bin/python3", ["superproductivity-bin", "-c", sys.argv[2], "--user-data-dir=" + sys.argv[1], "--rest-api-port=9"])' \
+    "$DATA" "$code" "$FAKE_PIDS"
+  pid=$(awk 'END { print }' "$FAKE_PIDS")
+  i=0
+  while [[ $i -lt 50 ]]; do
+    if [[ -r /proc/$pid/cmdline ]]; then
+      cmd0=
+      IFS= read -r -d '' cmd0 <"/proc/$pid/cmdline" || true
+      if [[ $(basename "$cmd0") == superproductivity-bin ]]; then
+        SPAWNED=$pid
+        return 0
+      fi
+    fi
+    i=$((i + 1))
+    sleep 0.05
+  done
+  fail "fake app did not start"
+}
+
+assert_marker() {
+  grep -qx "$1" "$DATA/profile-marker" || fail "profile marker is not $1"
+}
+
+assert_no_complete() {
+  local hit=
+  if [[ -d $STATE/backups ]]; then
+    hit=$(find "$STATE/backups" -name complete -print -quit)
+  fi
+  [[ -z $hit ]] || fail "failed backup was kept"
+}
+
+test_usage() {
+  setup_case
+  STATUS=0
+  "$SCRIPT" --bogus >"$CASE/out" 2>"$CASE/err" || STATUS=$?
+  assert_status 2
+}
+
+test_missing_host() {
+  setup_case
+  STATUS=0
+  env -u SP_UPDATE_HOST "$SCRIPT" >"$CASE/out" 2>"$CASE/err" || STATUS=$?
+  assert_status 1
+  grep -F -q 'SP_UPDATE_HOST and SP_UPDATE_DIR are not set' "$CASE/out" || fail "missing host log"
+  assert_messages 0
+}
+
+test_same_sha() {
+  setup_case
+  printf '%s  %s\n' "$APP_SHA" "$APP" >"$LAUNCH/versions/$OLD_VERSION/.sp-launch-source"
+  run_update
+  assert_status 0
+  assert_not_logged '^fetch$'
+  grep -F -q 'installed build is current' "$CASE/out" || fail "expected current log"
+  assert_current "$OLD_VERSION"
+  assert_messages 0
+}
+
+test_older() {
+  setup_case
+  printf '%s %s\n' "$OLD_SHA" '2026-11-05T00:00:00-05:00' >"$STATE/applied"
+  run_update
+  assert_status 0
+  assert_not_logged '^fetch$'
+  grep -F -q 'delivered build is older than the one recorded here' "$CASE/out" || fail "expected older log"
+  assert_current "$OLD_VERSION"
+  assert_messages 0
+}
+
+test_check() {
+  setup_case
+  run_update --check
+  assert_status 0
+  assert_not_logged '^fetch$'
+  grep -F -q "newer build $COMMIT" "$CASE/out" || fail "expected newer log"
+  assert_current "$OLD_VERSION"
+  assert_messages 0
+}
+
+test_stage_busy() {
+  local old got
+  setup_case
+  spawn_app
+  old=$SPAWNED
+  run_update
+  assert_status 0
+  assert_log '^fetch$'
+  assert_not_logged '^install '
+  assert_not_logged '^start$'
+  grep -F -q 'staged superProductivity-arm64-aaaaaaa.AppImage' "$CASE/out" || fail "expected staged log"
+  [[ -r /proc/$old/cmdline ]] || fail "app was stopped while the desktop was in use"
+  assert_marker before
+  assert_sync_kept
+  assert_current "$OLD_VERSION"
+  assert_messages 0
+  [[ -f $DEST/$APP_NAME ]] || fail "download was not staged"
+  got=$(sha256sum "$DEST/$APP_NAME" | awk '{ print $1; exit }')
+  [[ $got == "$APP_SHA" ]] || fail "staged file checksum differs"
+}
+
+test_idle_install() {
+  local old new bak got_sha got_built
+  setup_case
+  export FAKE_IDLE=yes
+  spawn_app
+  old=$SPAWNED
+  run_update
+  assert_status 0
+  assert_log '^fetch$'
+  assert_log "^install $NEW_VER$"
+  assert_log '^start$'
+  [[ ! -d /proc/$old ]] || fail "previous process was left running"
+  new=$(main_pid "$DATA") || fail "new process was not started"
+  [[ $new != "$old" ]] || fail "process was not replaced"
+  assert_current "$NEW_VER"
+  assert_marker after
+  [[ -d $DATA/Migration ]] || fail "new version did not leave its marker"
+  assert_sync_kept
+  [[ -f $DATA/Cache/junk ]] || fail "cache was removed from the live profile"
+  bak=$(one_backup)
+  grep -qx before "$bak/profile/profile-marker" || fail "backup was taken after the new version started"
+  [[ ! -e $bak/profile/Cache ]] || fail "cache was copied into the backup"
+  [[ ! -e $bak/profile/Code\ Cache ]] || fail "code cache was copied into the backup"
+  [[ ! -e $bak/profile/Migration ]] || fail "backup includes files written after it"
+  [[ -f $bak/profile/.keep ]] || fail "dotfile was not backed up"
+  cmp -s "$CASE/sync-orig" "$bak/profile/sync-marker" || fail "backup sync marker differs"
+  cmp -s "$CASE/json-orig" "$bak/app-backup.json" || fail "backup json differs"
+  read -r got_sha got_built <"$STATE/applied"
+  [[ $got_sha == "$APP_SHA" && $got_built == "$BUILT" ]] || fail "applied record differs"
+  assert_ntfy 3 "Installed $COMMIT."
+  assert_messages 1
+  grep -F -q 'projects 1->1 tasks 2->2' "$CASE/out" || fail "fingerprint counts missing"
+}
+
+test_login_install() {
+  local bak
+  setup_case
+  export FAKE_IDLE=no
+  export SP_UPDATE_SESSION_AGE_SEC=30
+  printf '%s %s\n' "$OLD_SHA" "$BUILT" >"$STATE/applied"
+  run_update
+  assert_status 0
+  assert_current "$NEW_VER"
+  assert_marker after
+  assert_sync_kept
+  bak=$(one_backup)
+  grep -qx before "$bak/profile/profile-marker" || fail "login backup marker differs"
+  [[ ! -e $bak/profile/Cache ]] || fail "login backup copied cache"
+  cmp -s "$CASE/json-orig" "$bak/app-backup.json" || fail "login backup json differs"
+  assert_ntfy 3 "Installed $COMMIT."
+  assert_messages 1
+}
+
+test_missing_json() {
+  local old
+  setup_case
+  export FAKE_IDLE=yes
+  rm -f "$DATA/backups/"*.json
+  spawn_app
+  old=$SPAWNED
+  run_update
+  assert_status 1
+  assert_ntfy 4 "Update skipped. The data backup failed, so nothing was installed."
+  assert_messages 1
+  assert_not_logged '^install '
+  assert_log '^start$'
+  assert_current "$OLD_VERSION"
+  assert_marker before
+  assert_sync_kept
+  [[ ! -d /proc/$old ]] || fail "app that was stopped for backup was left as the old pid"
+  main_pid "$DATA" >/dev/null || fail "previous version was not started again"
+  assert_no_complete
+}
+
+test_health_fail() {
+  setup_case
+  export FAKE_IDLE=yes
+  export FAKE_HEALTH=fail
+  run_update
+  assert_status 1
+  assert_ntfy 5 "Update failed. The previous version is running and the data backup was restored."
+  assert_messages 1
+  assert_current "$OLD_VERSION"
+  assert_marker before
+  assert_sync_kept
+  [[ ! -e $DATA/Migration ]] || fail "migration file survived rollback"
+  [[ -f $DATA/Cache/junk ]] || fail "cache was removed during rollback"
+  cmp -s "$CASE/json-orig" "$DATA/backups/2026-11-04_000000.json" || fail "restored json differs"
+  kill_fakes
+  run_update
+  assert_status 1
+  assert_messages 1
+  assert_current "$OLD_VERSION"
+  assert_marker before
+}
+
+test_offline() {
+  setup_case
+  : >"$REMOTE/offline"
+  run_update
+  assert_status 0
+  assert_messages 0
+  assert_not_logged '^fetch$'
+  grep -F -q 'build machine unreachable' "$CASE/out" || fail "expected unreachable log"
+  assert_current "$OLD_VERSION"
+}
+
+test_bad_listing() {
+  setup_case
+  printf 'nope bad\n' >"$REMOTE/latest.sha256"
+  run_update
+  assert_status 1
+  assert_ntfy 4 "Update skipped. The build listing could not be checked."
+  assert_messages 1
+  assert_not_logged '^fetch$'
+  assert_current "$OLD_VERSION"
+}
+
+test_bad_download() {
+  setup_case
+  : >"$REMOTE/bad-download"
+  run_update
+  assert_status 1
+  assert_ntfy 4 "Update skipped. The download did not match its checksum."
+  assert_messages 1
+  assert_log '^fetch$'
+  assert_not_logged '^install '
+  assert_current "$OLD_VERSION"
+}
+
+test_no_quit() {
+  local old
+  setup_case
+  export FAKE_IDLE=yes
+  spawn_app stubborn
+  old=$SPAWNED
+  run_update
+  assert_status 0
+  assert_ntfy 4 "Update is waiting. The app did not quit, so nothing was installed."
+  assert_messages 1
+  assert_not_logged '^install '
+  [[ -r /proc/$old/cmdline ]] || fail "stubborn app was killed"
+  assert_marker before
+  assert_current "$OLD_VERSION"
+  assert_sync_kept
+}
+
+test_empty_fingerprint() {
+  setup_case
+  export FAKE_IDLE=yes
+  printf '%s\n' '{"task":{"ids":[]},"project":{"ids":["p1"]},"globalConfig":{"sync":{"isEnabled":false}}}' \
+    >"$DATA/backups/2026-11-04_000000.json"
+  run_update
+  assert_status 1
+  assert_ntfy 4 "Update skipped. The data backup failed, so nothing was installed."
+  assert_not_logged '^install '
+  assert_current "$OLD_VERSION"
+  assert_no_complete
+}
+
+test_prune() {
+  local name
+  setup_case
+  for name in 01 02 03 04 05 06; do
+    mkdir -p "$STATE/backups/2026-01-$name"
+    : >"$STATE/backups/2026-01-$name/complete"
+  done
+  mkdir -p "$STATE/backups/incomplete"
+  prune_backups
+  [[ ! -d $STATE/backups/2026-01-01 ]] || fail "oldest backup was kept"
+  [[ -d $STATE/backups/2026-01-02 ]] || fail "newer backup was pruned"
+  [[ -d $STATE/backups/2026-01-06 ]] || fail "newest backup was pruned"
+  [[ -d $STATE/backups/incomplete ]] || fail "incomplete backup was pruned"
+  if shopt -q dotglob; then
+    fail "dotglob leaked from prune"
+  fi
+}
+
+test_backup_restore() {
+  local dest
+  setup_case
+  dest=$STATE/backups/manual
+  backup_profile "$DATA" "$dest"
+  [[ ! -e $dest/profile/Cache ]] || fail "cache copied"
+  [[ ! -e $dest/profile/Code\ Cache ]] || fail "code cache copied"
+  [[ -f $dest/profile/.keep ]] || fail "dotfile missed"
+  cmp -s "$CASE/sync-orig" "$dest/profile/sync-marker" || fail "sync marker bytes differ"
+  cmp -s "$CASE/json-orig" "$dest/app-backup.json" || fail "json copy differs"
+  if shopt -q dotglob || shopt -q nullglob; then
+    fail "backup leaked a shell glob option"
+  fi
+  printf 'changed\n' >"$DATA/profile-marker"
+  mkdir -p "$DATA/Migration"
+  printf 'new\n' >"$DATA/Migration/state"
+  printf 'extra\n' >"$DATA/extra"
+  restore_profile "$dest" "$DATA"
+  assert_marker before
+  [[ ! -e $DATA/Migration ]] || fail "restore left a file the backup does not have"
+  [[ ! -e $DATA/extra ]] || fail "restore left an extra file"
+  [[ -f $DATA/Cache/junk ]] || fail "restore removed cache"
+  [[ -f $DATA/Code\ Cache/x ]] || fail "restore removed code cache"
+  [[ -f $DATA/.keep ]] || fail "restore dropped a dotfile"
+  assert_sync_kept
+  cmp -s "$CASE/json-orig" "$DATA/backups/2026-11-04_000000.json" || fail "restored json differs"
+  if shopt -q dotglob; then
+    fail "dotglob leaked from restore"
+  fi
+  rm -f "$DATA/backups/"*.json
+  if backup_profile "$DATA" "$STATE/backups/nojson"; then
+    fail "backup without a json export should fail"
+  fi
+  rm -rf "$DATA/backups" "$DATA/IndexedDB"
+  if backup_profile "$DATA" "$STATE/backups/nodata"; then
+    fail "backup without profile data should fail"
+  fi
+}
+
+capture_live
+write_fakes
+export PATH="$FAKEBIN:/usr/bin:/bin"
+hash -r
+[[ $(command -v ssh) == "$FAKEBIN/ssh" ]] || fail "ssh is not the fake"
+[[ $(command -v sp-launch) == "$FAKEBIN/sp-launch" ]] || fail "sp-launch is not the fake"
+[[ $(command -v curl) == "$FAKEBIN/curl" ]] || fail "curl is not the fake"
+printf 'fake-appimage-v1\n' >"$APP"
+APP_SHA=$(sha256sum "$APP" | awk '{ print $1; exit }')
+NEW_VER=${APP_SHA:0:16}
+: >"$WORKDIR/empty-config"
+# shellcheck source=scripts/sp-update
+source "$SCRIPT"
+trap finish EXIT
+
+test_usage
+test_missing_host
+test_same_sha
+test_older
+test_check
+test_stage_busy
+test_idle_install
+test_login_install
+test_missing_json
+test_health_fail
+test_offline
+test_bad_listing
+test_bad_download
+test_no_quit
+test_empty_fingerprint
+test_prune
+test_backup_restore
+
+printf 'ok\n'
