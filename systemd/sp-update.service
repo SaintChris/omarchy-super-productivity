@@ -1,0 +1,10 @@
+[Unit]
+Description=Install a newer Super Productivity build when the desktop is idle
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-%h/.config/sp-update/config
+ExecStart=%h/.local/bin/sp-update
+Nice=15
+TimeoutStartSec=20min

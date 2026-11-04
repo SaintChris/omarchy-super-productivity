@@ -1,0 +1,816 @@
+#!/usr/bin/env bash
+# sp-update: on a laptop, follow a Super Productivity AppImage built on another machine.
+#
+#   sp-update           check, and install when the desktop is idle or the session just started
+#   sp-update --check   only compare the delivered build with the installed one
+#
+# The delivery folder (SP_UPDATE_HOST, SP_UPDATE_DIR) holds latest.txt, latest.sha256 and the
+# AppImage, as `sp-fetch` describes. A newer build is downloaded and checked at once. Installing
+# waits until the desktop has been idle, or until shortly after login, and it happens in one run:
+# quit the app, back up the profile, `sp-launch install`, start it, and check the local API.
+# The backup is what a rollback restores, together with the previous unpacked version, so it is
+# taken after the app has quit and immediately before the new version is installed.
+#
+# Settings come from the environment or from SP_UPDATE_CONFIG (default ~/.config/sp-update/config),
+# a KEY=value file. The ntfy topic is the contents of SP_UPDATE_NTFY_TOPIC_FILE, never this script.
+# SP_UPDATE_NTFY_SINK, when set, records the message locally and does not send it.
+set -euo pipefail
+
+REMOTE_SHA=
+REMOTE_NAME=
+REMOTE_COMMIT=
+REMOTE_BUILT=
+
+usage() { sed -n '3,4p' "$0" | sed 's/^# *//' >&2; exit 2; }
+
+log() { printf '%s\n' "$*"; }
+
+state_dir() {
+  printf '%s\n' "${SP_UPDATE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/sp-update}"
+}
+
+launch_root() {
+  if [[ -n ${SP_LAUNCH_ROOT:-} ]]; then
+    printf '%s\n' "$SP_LAUNCH_ROOT"
+  elif [[ -n ${XDG_DATA_HOME:-} ]]; then
+    printf '%s\n' "$XDG_DATA_HOME/sp-launch"
+  else
+    printf '%s\n' "$HOME/.local/share/sp-launch"
+  fi
+}
+
+fetch_dest() {
+  printf '%s\n' "${SP_UPDATE_FETCH_DEST:-${SP_FETCH_DEST:-$HOME/Applications}}"
+}
+
+load_config() {
+  local file=${SP_UPDATE_CONFIG:-$HOME/.config/sp-update/config}
+  [[ -f $file ]] || return 0
+  local line key val
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^[[:space:]]*# ]] && continue
+    [[ $line =~ ^[[:space:]]*$ ]] && continue
+    [[ $line =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+    key=${BASH_REMATCH[1]}
+    val=${BASH_REMATCH[2]}
+    if [[ $val == \"*\" ]]; then
+      val=${val#\"}
+      val=${val%\"}
+    fi
+    if [[ -z ${!key-} ]]; then
+      printf -v "$key" '%s' "$val"
+    fi
+  done <"$file"
+}
+
+is_ephemeral() {
+  case $1 in
+    Cache | "Code Cache" | GPUCache | DawnWebGPUCache | DawnGraphiteCache | Dictionaries | Crashpad | blob_storage | SingletonLock | SingletonCookie | SingletonSocket | DevToolsActivePort)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+ssh_cat() {
+  local path=$1
+  ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
+    "$SP_UPDATE_HOST" cat "$path"
+}
+
+read_listing() {
+  local sha_line txt
+  sha_line=$(ssh_cat "$SP_UPDATE_DIR/latest.sha256") || return 1
+  txt=$(ssh_cat "$SP_UPDATE_DIR/latest.txt") || return 1
+  read -r REMOTE_SHA REMOTE_NAME <<<"$sha_line"
+  REMOTE_COMMIT=$(printf '%s\n' "$txt" | awk '/^commit / { sub(/^commit /, ""); print; exit }')
+  REMOTE_BUILT=$(printf '%s\n' "$txt" | awk '/^built / { sub(/^built /, ""); print; exit }')
+}
+
+listing_ok() {
+  [[ $REMOTE_SHA =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ $REMOTE_NAME =~ ^superProductivity-arm64-[0-9a-f]{7,40}\.AppImage$ ]] || return 1
+  [[ $REMOTE_COMMIT =~ ^[0-9a-f]{7,40}$ ]] || return 1
+  [[ -n $REMOTE_BUILT ]] || return 1
+  date -d "$REMOTE_BUILT" +%s >/dev/null 2>&1 || return 1
+}
+
+current_version() {
+  local link
+  link=$(readlink "$(launch_root)/current") || return 1
+  basename "$link"
+}
+
+installed_sha() {
+  local ver root line
+  root=$(launch_root)
+  ver=$(current_version) || return 1
+  line=$(awk 'NR==1 { print $1; exit }' "$root/versions/$ver/.sp-launch-source") || return 1
+  [[ $line =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$line"
+}
+
+newer_or_equal() {
+  local left right
+  left=$(date -d "$1" +%s) || return 1
+  right=$(date -d "$2" +%s) || return 1
+  [[ $left -ge $right ]]
+}
+
+is_newer() {
+  local installed applied_built state
+  installed=$(installed_sha || true)
+  if [[ -n $installed && $installed == "$REMOTE_SHA" ]]; then
+    log "installed build is current"
+    return 1
+  fi
+  state=$(state_dir)
+  applied_built=
+  if [[ -f $state/applied ]]; then
+    applied_built=$(awk 'NR==1 { print $2; exit }' "$state/applied")
+  fi
+  if [[ -n $applied_built ]] && ! newer_or_equal "$REMOTE_BUILT" "$applied_built"; then
+    log "delivered build is older than the one recorded here"
+    return 1
+  fi
+  return 0
+}
+
+stage_appimage() {
+  local dest file got
+  dest=$(fetch_dest)
+  mkdir -p "$dest"
+  file=$dest/$REMOTE_NAME
+  if [[ -f $file ]]; then
+    got=$(sha256sum "$file" | awk '{ print $1 }')
+    if [[ $got == "$REMOTE_SHA" ]]; then
+      log "already downloaded: $REMOTE_NAME"
+      return 0
+    fi
+  fi
+  SP_FETCH_DEST=$dest sp-fetch "$SP_UPDATE_HOST" "$SP_UPDATE_DIR" --no-install
+  [[ -f $file ]] || return 1
+  got=$(sha256sum "$file" | awk '{ print $1 }')
+  [[ $got == "$REMOTE_SHA" ]]
+}
+
+session_age() {
+  local ts epoch now
+  if [[ -n ${SP_UPDATE_SESSION_AGE_SEC:-} ]]; then
+    printf '%s\n' "$SP_UPDATE_SESSION_AGE_SEC"
+    return 0
+  fi
+  ts=$(loginctl show-session auto -p Timestamp --value) || return 1
+  epoch=$(date -d "$ts" +%s) || return 1
+  now=$(date +%s)
+  printf '%s\n' $((now - epoch))
+}
+
+in_login_window() {
+  local age window
+  window=${SP_UPDATE_LOGIN_WINDOW:-900}
+  age=$(session_age) || return 1
+  [[ $age =~ ^[0-9]+$ ]] || return 1
+  [[ $age -le $window ]]
+}
+
+desktop_idle() {
+  local helper out root hint
+  root=$(launch_root)
+  helper=$root/current/wayland-idle-helper
+  if [[ ! -x $helper ]]; then
+    helper=$(command -v wayland-idle-helper || true)
+  fi
+  if [[ -n $helper && -x $helper ]]; then
+    out=$(timeout 5 "$helper" --timeout-ms "${SP_UPDATE_IDLE_MS:-120000}" 2>/dev/null || true)
+    if printf '%s\n' "$out" | grep -qx idle; then
+      return 0
+    fi
+    return 1
+  fi
+  hint=$(loginctl show-session auto -p IdleHint --value 2>/dev/null || true)
+  [[ $hint == yes ]]
+}
+
+should_apply() {
+  if in_login_window; then
+    log "session just started; installing"
+    return 0
+  fi
+  if desktop_idle; then
+    log "desktop is idle; installing"
+    return 0
+  fi
+  return 1
+}
+
+# Print pids whose argv0 is superproductivity-bin and whose --user-data-dir matches.
+# With "main", skip helper processes (--type=).
+matching_pids() {
+  local data=$1 mode=${2:-all} pid_path pid cmd0 base dir arg
+  [[ -n $data ]] || return 0
+  for pid_path in /proc/[0-9]*; do
+    pid=${pid_path#/proc/}
+    [[ -r $pid_path/cmdline ]] || continue
+    cmd0=
+    IFS= read -r -d '' cmd0 <"$pid_path/cmdline" || true
+    [[ -n $cmd0 ]] || continue
+    base=$(basename "$cmd0")
+    [[ $base == superproductivity-bin ]] || continue
+    dir=
+    while IFS= read -r -d '' arg || [[ -n $arg ]]; do
+      case $arg in
+        --user-data-dir=*) dir=${arg#--user-data-dir=} ;;
+      esac
+    done <"$pid_path/cmdline"
+    [[ $dir == "$data" ]] || continue
+    if [[ $mode == main ]]; then
+      local typed=0
+      while IFS= read -r -d '' arg || [[ -n $arg ]]; do
+        [[ $arg == --type=* ]] && typed=1
+      done <"$pid_path/cmdline"
+      [[ $typed == 0 ]] || continue
+    fi
+    printf '%s\n' "$pid"
+  done
+}
+
+main_pid() {
+  local -a pids=()
+  mapfile -t pids < <(matching_pids "$1" main || true)
+  [[ ${#pids[@]} -gt 0 && -n ${pids[0]} ]] || return 1
+  printf '%s\n' "${pids[0]}"
+}
+
+read_start_args() {
+  local data=$1 pid cmd0
+  local -n _out=$2
+  pid=$(main_pid "$data") || return 1
+  _out=()
+  local first=1 arg
+  while IFS= read -r -d '' arg || [[ -n $arg ]]; do
+    if [[ $first == 1 ]]; then
+      first=0
+      cmd0=$arg
+      continue
+    fi
+    _out+=("$arg")
+  done <"/proc/$pid/cmdline"
+  [[ $(basename "$cmd0") == superproductivity-bin ]] || return 1
+}
+
+args_match_data() {
+  local data=$1 arg
+  shift
+  for arg in "$@"; do
+    [[ $arg == "--user-data-dir=$data" ]] && return 0
+  done
+  return 1
+}
+
+port_of() {
+  local arg
+  for arg in "$@"; do
+    if [[ $arg == --rest-api-port=* ]]; then
+      printf '%s\n' "${arg#--rest-api-port=}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+api_get() {
+  local port=$1 path=$2 outfile=$3 header=${4:-}
+  local -a curl_args
+  [[ $port =~ ^[0-9]+$ ]] || return 1
+  case $path in
+    /health | /projects | /tasks\?*) ;;
+    *) return 1 ;;
+  esac
+  curl_args=(--noproxy '*' -fsS -X GET --max-time 20 -o "$outfile" "http://127.0.0.1:${port}${path}")
+  if [[ -n $header && $path != /health ]]; then
+    curl_args+=(-H "@${header}")
+  fi
+  curl "${curl_args[@]}"
+}
+
+auth_header() {
+  local data=$1 dest token
+  [[ -f $data/local-rest-api-token ]] || return 1
+  token=$(<"$data/local-rest-api-token")
+  [[ -n $token ]] || return 1
+  dest=$(mktemp)
+  chmod 600 "$dest"
+  printf 'Authorization: Bearer %s\n' "$token" >"$dest"
+  printf '%s\n' "$dest"
+}
+
+write_fingerprint() {
+  # write_fingerprint <outfile> <mode> <json-file> reads an API body or an app backup.
+  local outfile=$1 mode=$2 infile=$3
+  [[ -s $infile ]] || return 1
+  python3 - "$outfile" "$mode" "$infile" <<'PY'
+import json, sys
+outfile, mode, infile = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def as_ids(node):
+    if isinstance(node, dict) and isinstance(node.get("ids"), list):
+        return [str(i) for i in node["ids"]]
+    return []
+
+def from_backup(doc):
+    tasks = as_ids(doc.get("task"))
+    for key in ("archiveYoung", "archiveOld"):
+        arch = doc.get(key) or {}
+        if isinstance(arch, dict):
+            tasks += as_ids(arch.get("task"))
+    projects = as_ids(doc.get("project"))
+    return projects, tasks
+
+def from_api(doc):
+    data = doc.get("data", doc) if isinstance(doc, dict) else doc
+    ids = []
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and "id" in item:
+                ids.append(str(item["id"]))
+    return ids
+
+with open(infile, encoding="utf-8") as handle:
+    raw = json.load(handle)
+if mode == "backup":
+    projects, tasks = from_backup(raw)
+    label = "superset"
+elif mode == "projects":
+    projects, tasks = from_api(raw), None
+    label = None
+else:
+    projects, tasks = None, from_api(raw)
+    label = None
+
+if label is None:
+    kind = "project" if mode == "projects" else "task"
+    values = projects if mode == "projects" else tasks
+    with open(outfile, "a", encoding="utf-8") as out:
+        for value in sorted(set(values)):
+            out.write(f"{kind} {value}\n")
+else:
+    if not projects or not tasks:
+        sys.exit(1)
+    with open(outfile, "w", encoding="utf-8") as out:
+        out.write(f"mode {label}\n")
+        for value in sorted(set(projects)):
+            out.write(f"project {value}\n")
+        for value in sorted(set(tasks)):
+            out.write(f"task {value}\n")
+PY
+}
+
+snapshot_api() {
+  local data=$1 port=$2 outfile=$3 header body
+  header=$(auth_header "$data") || return 1
+  body=$(mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f $(printf '%q' "$header") $(printf '%q' "$body")" RETURN
+  : >"$outfile"
+  printf 'mode exact\n' >"$outfile"
+  api_get "$port" /projects "$body" "$header" || return 1
+  write_fingerprint "$outfile" projects "$body" || return 1
+  api_get "$port" "/tasks?source=all&includeDone=true" "$body" "$header" || return 1
+  write_fingerprint "$outfile" tasks "$body" || return 1
+  grep -q '^project ' "$outfile" || return 1
+  grep -q '^task ' "$outfile" || return 1
+}
+
+fingerprint_from_backup() {
+  local json=$1 outfile=$2
+  [[ -s $json ]] || return 1
+  write_fingerprint "$outfile" backup "$json"
+}
+
+fingerprints_match() {
+  python3 - "$1" "$2" <<'PY'
+import sys
+def load(path):
+    mode, projects, tasks = "exact", set(), set()
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            parts = line.split()
+            if len(parts) != 2:
+                continue
+            if parts[0] == "mode":
+                mode = parts[1]
+            elif parts[0] == "project":
+                projects.add(parts[1])
+            elif parts[0] == "task":
+                tasks.add(parts[1])
+    return mode, projects, tasks
+before, after = load(sys.argv[1]), load(sys.argv[2])
+missing_projects = before[1] - after[1]
+missing_tasks = before[2] - after[2]
+print(f"projects {len(before[1])}->{len(after[1])} tasks {len(before[2])}->{len(after[2])}")
+if missing_projects or missing_tasks:
+    sys.exit(1)
+if before[0] == "exact" and (before[1] != after[1] or before[2] != after[2]):
+    sys.exit(1)
+PY
+}
+
+api_up() {
+  local port=$1 body
+  body=$(mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f $(printf '%q' "$body")" RETURN
+  api_get "$port" /health "$body"
+}
+
+wait_health() {
+  local port=$1 try tries
+  tries=${SP_UPDATE_HEALTH_TRIES:-30}
+  [[ $tries =~ ^[0-9]+$ ]] || tries=30
+  try=0
+  while [[ $try -lt $tries ]]; do
+    if api_up "$port"; then
+      return 0
+    fi
+    try=$((try + 1))
+    if [[ $try -lt $tries ]]; then
+      sleep 1
+    fi
+  done
+  return 1
+}
+
+latest_backup_json() {
+  local data=$1 line path
+  [[ -d $data/backups ]] || return 1
+  line=$(find "$data/backups" -maxdepth 1 -type f -name '*.json' -printf '%T@\t%p\n' | sort -n | awk 'END { print }')
+  [[ -n $line ]] || return 1
+  path=${line#*$'\t'}
+  [[ -s $path ]] || return 1
+  printf '%s\n' "$path"
+}
+
+backup_profile() {
+  local data=$1 dest=$2 entry name latest rc
+  [[ -n $data && $data != / && -d $data ]] || return 1
+  [[ -n $dest && $dest != / ]] || return 1
+  mkdir -p -- "$dest"
+  chmod 700 "$dest"
+  if [[ ! -d $dest/profile ]]; then
+    mkdir -m 700 -- "$dest/profile"
+  else
+    chmod 700 "$dest/profile"
+  fi
+  shopt -s dotglob nullglob
+  rc=0
+  for entry in "$data"/*; do
+    name=$(basename "$entry")
+    if is_ephemeral "$name"; then
+      continue
+    fi
+    if ! cp -a "$entry" "$dest/profile/"; then
+      rc=1
+      break
+    fi
+  done
+  shopt -u dotglob nullglob
+  [[ $rc == 0 ]] || return 1
+  [[ -d $dest/profile/IndexedDB || -d $dest/profile/backups ]] || return 1
+  latest=$(latest_backup_json "$data") || return 1
+  cp -a "$latest" "$dest/app-backup.json" || return 1
+  cmp -s "$latest" "$dest/app-backup.json"
+}
+
+restore_profile() {
+  local backup=$1 data=$2 work entry name rc
+  [[ -n $data && $data != / && -d $data ]] || return 1
+  [[ -d $backup/profile ]] || return 1
+  work=$(mktemp -d "$(dirname "$data")/.sp-update-restore.XXXXXX")
+  if ! cp -a "$backup/profile/." "$work/"; then
+    rm -rf "$work"
+    return 1
+  fi
+  shopt -s dotglob nullglob
+  rc=0
+  for entry in "$data"/*; do
+    name=$(basename "$entry")
+    if is_ephemeral "$name"; then
+      continue
+    fi
+    if [[ -e $work/$name ]]; then
+      continue
+    fi
+    if ! rm -rf -- "$entry"; then
+      rc=1
+      break
+    fi
+  done
+  if [[ $rc == 0 ]]; then
+    for entry in "$work"/*; do
+      name=$(basename "$entry")
+      if ! rm -rf -- "${data:?}/${name:?}" || ! mv "$entry" "${data:?}/${name:?}"; then
+        rc=1
+        break
+      fi
+    done
+  fi
+  shopt -u dotglob nullglob
+  rm -rf "$work"
+  [[ $rc == 0 ]] || return 1
+  [[ -s $backup/app-backup.json ]] || return 1
+  cmp -s "$backup/app-backup.json" "$(latest_backup_json "$data")"
+}
+
+prune_backups() {
+  local state dir
+  local -a found=() sorted=()
+  state=$(state_dir)
+  shopt -s nullglob
+  for dir in "$state/backups"/*; do
+    [[ -f $dir/complete ]] || continue
+    found+=("$dir")
+  done
+  shopt -u nullglob
+  [[ ${#found[@]} -le 5 ]] && return 0
+  mapfile -t sorted < <(printf '%s\n' "${found[@]}" | sort)
+  local drop=$((${#sorted[@]} - 5)) i
+  for ((i = 0; i < drop; i++)); do
+    rm -rf -- "${sorted[$i]}"
+  done
+}
+
+point_current() {
+  local version=$1 root tmp
+  root=$(launch_root)
+  tmp=$root/.current-sp-update
+  rm -f "$tmp"
+  ln -s "versions/$version" "$tmp"
+  mv -Tf "$tmp" "$root/current"
+}
+
+stop_matching() {
+  local data=$1 force=${2:-} pid limit i
+  local -a pids=()
+  limit=${SP_UPDATE_QUIT_WAIT:-30}
+  [[ $limit =~ ^[0-9]+$ ]] || limit=30
+  mapfile -t pids < <(matching_pids "$data" main)
+  [[ ${#pids[@]} -gt 0 ]] || return 0
+  for pid in "${pids[@]}"; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  i=0
+  while [[ $i -lt $limit ]]; do
+    mapfile -t pids < <(matching_pids "$data" all)
+    [[ ${#pids[@]} -eq 0 ]] && return 0
+    i=$((i + 1))
+    if [[ $i -lt $limit ]]; then
+      sleep 1
+    fi
+  done
+  [[ $force == force ]] || return 1
+  mapfile -t pids < <(matching_pids "$data" all)
+  for pid in "${pids[@]}"; do
+    kill -KILL "$pid" 2>/dev/null || true
+  done
+  sleep 1
+  mapfile -t pids < <(matching_pids "$data" all)
+  [[ ${#pids[@]} -eq 0 ]]
+}
+
+start_main() {
+  sp-launch start -- "$@"
+}
+
+notify() {
+  local priority=$1 body=$2 topic_file sink
+  sink=${SP_UPDATE_NTFY_SINK:-}
+  if [[ -n $sink ]]; then
+    printf '%s\n%s\n' "$priority" "$body" >>"$sink"
+    return 0
+  fi
+  topic_file=${SP_UPDATE_NTFY_TOPIC_FILE:-}
+  [[ -n $topic_file && -r $topic_file ]] || {
+    log "ntfy skipped: no topic file"
+    return 0
+  }
+  if ! python3 - "$topic_file" "$priority" "$body" <<'PY'
+import json, sys, urllib.request
+topic = open(sys.argv[1], encoding="utf-8").read().strip()
+priority = int(sys.argv[2])
+body = sys.argv[3]
+if not topic or any(c in topic for c in "/ \n\t") or len(topic) > 64:
+    sys.exit(0)
+tags = ["white_check_mark"] if priority < 4 else ["warning"]
+payload = {
+    "topic": topic,
+    "title": "Laptop · Super Productivity",
+    "message": body,
+    "priority": priority,
+    "tags": tags,
+}
+req = urllib.request.Request(
+    "https://ntfy.sh/",
+    data=json.dumps(payload).encode(),
+    headers={"Content-Type": "application/json"},
+)
+try:
+    urllib.request.urlopen(req, timeout=20).read()
+except Exception:
+    sys.exit(1)
+PY
+  then
+    return 1
+  fi
+}
+
+notify_once() {
+  local key=$1 body=$2 kind=${3:-failure} state mark priority
+  state=$(state_dir)
+  mark=$state/notified-$key
+  [[ -e $mark ]] && return 0
+  case $kind in
+    success) priority=3 ;;
+    skip) priority=4 ;;
+    *) priority=5 ;;
+  esac
+  if notify "$priority" "$body"; then
+    : >"$mark"
+  else
+    log "ntfy not sent"
+  fi
+}
+
+short_commit() { printf '%.10s\n' "$REMOTE_COMMIT"; }
+
+apply_update() {
+  local data state dest stamp prev port was_running file root
+  local -a args=()
+  data=${SP_UPDATE_DATA_DIR:-}
+  [[ -n $data && -d $data ]] || {
+    log "no profile directory; not installing"
+    return 0
+  }
+  state=$(state_dir)
+  was_running=0
+  if main_pid "$data" >/dev/null; then
+    was_running=1
+    read_start_args "$data" args || {
+      log "could not read the running app's arguments; not installing"
+      return 1
+    }
+  else
+    [[ -n ${SP_UPDATE_START_ARGS:-} ]] || {
+      log "app is not running and no start arguments are set; not installing"
+      return 0
+    }
+    read -r -a args <<<"$SP_UPDATE_START_ARGS"
+  fi
+  args_match_data "$data" "${args[@]}" || {
+    log "start arguments do not match the profile; not installing"
+    return 1
+  }
+  port=$(port_of "${args[@]}") || {
+    log "no REST API port in the start arguments; not installing"
+    return 1
+  }
+  [[ -f $data/local-rest-api-token ]] || {
+    log "profile has no API token; not installing"
+    return 1
+  }
+
+  if [[ $was_running == 1 ]]; then
+    if ! in_login_window && ! desktop_idle; then
+      log "desktop is in use again; not installing"
+      return 0
+    fi
+    if ! api_up "$port" || ! snapshot_api "$data" "$port" "$state/pending-fingerprint"; then
+      notify_once "no-api-$REMOTE_SHA" "Update skipped. The app did not answer a status check, so nothing was installed." skip
+      return 1
+    fi
+    if ! stop_matching "$data"; then
+      notify_once "no-quit-$REMOTE_SHA" "Update is waiting. The app did not quit, so nothing was installed." skip
+      return 0
+    fi
+  fi
+
+  stamp=$(date +%Y-%m-%dT%H-%M-%S%z)
+  dest=$state/backups/$stamp
+  if ! backup_profile "$data" "$dest"; then
+    rm -rf "$dest"
+    notify_once "backup-$REMOTE_SHA" "Update skipped. The data backup failed, so nothing was installed." skip
+    if [[ $was_running == 1 ]]; then
+      start_main "${args[@]}" || log "could not start the app again"
+    fi
+    return 1
+  fi
+  if [[ $was_running == 1 ]]; then
+    cp -a "$state/pending-fingerprint" "$dest/fingerprint"
+  elif ! fingerprint_from_backup "$dest/app-backup.json" "$dest/fingerprint"; then
+    rm -rf "$dest"
+    notify_once "backup-$REMOTE_SHA" "Update skipped. The data backup failed, so nothing was installed." skip
+    return 1
+  fi
+  {
+    printf 'commit %s\n' "$REMOTE_COMMIT"
+    printf 'built %s\n' "$REMOTE_BUILT"
+    printf 'sha %s\n' "$REMOTE_SHA"
+  } >"$dest/manifest"
+  : >"$dest/complete"
+  prune_backups
+
+  prev=$(current_version || true)
+  root=$(launch_root)
+  if [[ -n $prev && ! -x $root/versions/$prev/AppRun ]]; then
+    log "previous version is not runnable; not installing"
+    if [[ $was_running == 1 ]]; then
+      start_main "${args[@]}" || log "could not start the app again"
+    fi
+    return 1
+  fi
+
+  file=$(fetch_dest)/$REMOTE_NAME
+  if ! sp-launch install "$file"; then
+    notify_once "install-$REMOTE_SHA" "Update skipped. The new build could not be installed." skip
+    if [[ $was_running == 1 ]]; then
+      start_main "${args[@]}" || log "could not start the app again"
+    fi
+    return 1
+  fi
+
+  if ! start_main "${args[@]}"; then
+    stop_matching "$data" force || true
+    [[ -n $prev ]] && point_current "$prev"
+    restore_profile "$dest" "$data" || log "could not restore the profile"
+    start_main "${args[@]}" || true
+    notify_once "rollback-$REMOTE_SHA" "Update failed. The previous version is running and the data backup was restored."
+    return 1
+  fi
+  if ! wait_health "$port" || ! snapshot_api "$data" "$port" "$state/running-fingerprint" || ! fingerprints_match "$dest/fingerprint" "$state/running-fingerprint"; then
+    log "new build did not come up with the same data; rolling back"
+    stop_matching "$data" force || true
+    [[ -n $prev ]] && point_current "$prev"
+    restore_profile "$dest" "$data" || log "could not restore the profile"
+    start_main "${args[@]}" || true
+    notify_once "rollback-$REMOTE_SHA" "Update failed. The previous version is running and the data backup was restored."
+    return 1
+  fi
+  printf '%s %s\n' "$REMOTE_SHA" "$REMOTE_BUILT" >"$state/applied"
+  notify_once "installed-$REMOTE_SHA" "Installed $(short_commit)." success
+  log "installed $(short_commit)"
+}
+
+main() {
+  local state mode
+  umask 077
+  mode=${1:-}
+  [[ -z $mode || $mode == --check ]] || usage
+  load_config
+  [[ -n ${SP_UPDATE_HOST:-} && -n ${SP_UPDATE_DIR:-} ]] || {
+    log "SP_UPDATE_HOST and SP_UPDATE_DIR are not set"
+    exit 1
+  }
+  state=$(state_dir)
+  mkdir -p -- "$state"
+  chmod 700 "$state"
+  exec 9>"$state/lock"
+  flock -n 9 || {
+    log "another check is running"
+    exit 0
+  }
+  if ! read_listing; then
+    log "build machine unreachable; will try on the next run"
+    exit 0
+  fi
+  if ! listing_ok; then
+    log "build listing is not usable"
+    if [[ $REMOTE_SHA =~ ^[0-9a-f]{64}$ ]]; then
+      notify_once "listing-$REMOTE_SHA" "Update skipped. The build listing could not be checked." skip
+    else
+      notify_once "listing-bad" "Update skipped. The build listing could not be checked." skip
+    fi
+    exit 1
+  fi
+  log "$SP_UPDATE_HOST has $REMOTE_NAME ($REMOTE_BUILT)"
+  if ! is_newer; then
+    exit 0
+  fi
+  log "newer build $(short_commit)"
+  if [[ $mode == --check ]]; then
+    exit 0
+  fi
+  if ! stage_appimage; then
+    log "download did not match its checksum"
+    notify_once "download-$REMOTE_SHA" "Update skipped. The download did not match its checksum." skip
+    exit 1
+  fi
+  if ! should_apply; then
+    log "staged $REMOTE_NAME; it will install when the desktop is idle, or at the next login"
+    exit 0
+  fi
+  apply_update
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi
