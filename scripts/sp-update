@@ -9,9 +9,10 @@
 # waits until the desktop has been idle, or until shortly after login, and it happens in one run:
 # read the current build's API, quit the app, back up the profile, `sp-launch install`, start it,
 # and check the local API again. The before-state is that API. When the app is not already
-# running, the current build is started on a throwaway copy of the profile and the copy is
-# discarded. The newest JSON backup is a second check: install does not proceed when it lists a
-# project or task the API does not. Rollback restores the backup and the previous unpacked
+# running, the current build is started on the real profile, the same way a login start does.
+# The newest JSON backup is a second check: install does not proceed when it lists a project or
+# task the API does not. A new start counts only when the profile lock's executable is inside
+# the unpacked folder `current` names. Rollback restores the backup and the previous unpacked
 # version, and reports the data restored only when the restarted app's API matches the before-state.
 #
 # Settings come from the environment or from SP_UPDATE_CONFIG (default ~/.config/sp-update/config),
@@ -677,34 +678,6 @@ notify_once() {
 
 short_commit() { printf '%.10s\n' "$REMOTE_COMMIT"; }
 
-# usable, empty, or absent. Empty means the newest JSON has no project or no task.
-json_backup_kind() {
-  local json
-  json=$(latest_backup_json "$1" || true)
-  if [[ -z $json ]]; then
-    printf 'absent\n'
-    return 0
-  fi
-  python3 - "$json" <<'PY'
-import json, sys
-
-def as_ids(node):
-    if isinstance(node, dict) and isinstance(node.get("ids"), list):
-        return [str(i) for i in node["ids"]]
-    return []
-
-with open(sys.argv[1], encoding="utf-8") as handle:
-    doc = json.load(handle)
-projects = as_ids(doc.get("project"))
-tasks = as_ids(doc.get("task"))
-for key in ("archiveYoung", "archiveOld"):
-    arch = doc.get(key) or {}
-    if isinstance(arch, dict):
-        tasks += as_ids(arch.get("task"))
-print("usable" if projects and tasks else "empty")
-PY
-}
-
 # Exit 0 when every JSON id is in the fingerprint. Extra API ids are allowed.
 # Exit 1 when the API is missing an id. Exit 2 when the JSON has no project or no task.
 json_ids_in_fingerprint() {
@@ -768,74 +741,18 @@ require_backup_ids() {
   return 1
 }
 
-port_closed() {
-  python3 -c 'import socket, sys
-s = socket.socket()
-s.settimeout(0.2)
-try:
-    rc = s.connect_ex(("127.0.0.1", int(sys.argv[1])))
-finally:
-    s.close()
-raise SystemExit(0 if rc != 0 else 1)' "$1"
-}
-
-pick_probe_port() {
-  local base=$1 cand try
-  if [[ -n ${SP_UPDATE_PROBE_PORT:-} ]]; then
-    [[ ${SP_UPDATE_PROBE_PORT} =~ ^[0-9]+$ ]] || return 1
-    printf '%s\n' "$SP_UPDATE_PROBE_PORT"
-    return 0
-  fi
-  [[ $base =~ ^[0-9]+$ ]] || return 1
-  cand=$((base + 1))
-  if [[ $cand -gt 65535 || $cand -lt 1 ]]; then
-    cand=1
-  fi
-  try=0
-  while [[ $try -lt 30 ]]; do
-    if [[ $cand -ne $base && $cand -ge 1 && $cand -le 65535 ]] && port_closed "$cand"; then
-      printf '%s\n' "$cand"
-      return 0
-    fi
-    cand=$((cand + 1))
-    if [[ $cand -gt 65535 ]]; then
-      cand=1
-    fi
-    try=$((try + 1))
-  done
-  return 1
-}
-
-# Start the current build against a copy of the profile, on a port other than
-# the app's, and write an API fingerprint. The copy is removed afterwards.
-probe_current_api() {
-  local data=$1 outfile=$2
-  shift 2
-  local probe pport rc arg saw_dir saw_port
-  local -a pargs=()
-  pport=$(pick_probe_port "$(port_of "$@")") || return 1
-  probe=$(mktemp -d "$(state_dir)/probe.XXXXXX")
-  chmod 700 "$probe"
-  rc=1
-  if copy_profile_contents "$data" "$probe"; then
-    saw_dir=0
-    saw_port=0
-    for arg in "$@"; do
-      case $arg in
-        --user-data-dir=*) pargs+=("--user-data-dir=$probe"); saw_dir=1 ;;
-        --rest-api-port=*) pargs+=("--rest-api-port=$pport"); saw_port=1 ;;
-        *) pargs+=("$arg") ;;
-      esac
-    done
-    if [[ $saw_dir == 1 && $saw_port == 1 ]]; then
-      if start_main "${pargs[@]}" && wait_health "$pport" && snapshot_api "$probe" "$pport" "$outfile"; then
-        rc=0
-      fi
-    fi
-  fi
-  stop_matching "$probe" force || true
-  rm -rf -- "$probe"
-  return "$rc"
+# The profile lock must name a live process whose executable is inside the
+# unpacked folder `current` points at. A second instance exits 0 and leaves
+# the previous build holding the lock.
+current_build_is_main() {
+  local data=$1 root ver pid exe
+  root=$(launch_root)
+  ver=$(current_version) || return 1
+  pid=$(singleton_pid "$data") || return 1
+  [[ -d /proc/$pid ]] || return 1
+  exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+  exe=${exe%' (deleted)'}
+  [[ -n $exe && $exe == "$root/versions/$ver/"* ]]
 }
 
 # Put the previous version and the profile backup back. Report the data
@@ -867,7 +784,7 @@ rollback_previous() {
 }
 
 apply_update() {
-  local data state dest stamp prev port was_running file root live live_port kind
+  local data state dest stamp prev port was_running file root live live_port
   local -a args=()
   data=${SP_UPDATE_DATA_DIR:-}
   [[ -n $data && -d $data ]] || {
@@ -912,6 +829,16 @@ apply_update() {
     return 1
   }
 
+  # Nothing is running: start the current build on the real profile, the same
+  # way a login start does, then read its API. Do not start a second copy.
+  if [[ $was_running == 0 ]]; then
+    if ! start_main "${args[@]}" || ! wait_health "$port"; then
+      notify_once "no-api-$REMOTE_SHA" "Update skipped. The app did not answer a status check, so nothing was installed." skip
+      return 1
+    fi
+    was_running=1
+  fi
+
   if [[ $was_running == 1 ]]; then
     if ! in_login_window && ! desktop_idle; then
       log "desktop is in use again; not installing"
@@ -927,19 +854,6 @@ apply_update() {
     if ! stop_matching "$data"; then
       notify_once "no-quit-$REMOTE_SHA" "Update is waiting. The app did not quit, so nothing was installed." skip
       return 0
-    fi
-  else
-    kind=$(json_backup_kind "$data")
-    if [[ $kind != usable ]]; then
-      notify_once "backup-$REMOTE_SHA" "Update skipped. The data backup failed, so nothing was installed." skip
-      return 1
-    fi
-    if ! probe_current_api "$data" "$state/pending-fingerprint" "${args[@]}"; then
-      notify_once "no-api-$REMOTE_SHA" "Update skipped. The app did not answer a status check, so nothing was installed." skip
-      return 1
-    fi
-    if ! require_backup_ids "$data" "$state/pending-fingerprint"; then
-      return 1
     fi
   fi
 
@@ -983,6 +897,11 @@ apply_update() {
 
   if ! start_main "${args[@]}"; then
     log "new build did not start; rolling back"
+    rollback_previous "$data" "$dest" "$prev" "$port" "$dest/fingerprint" "${args[@]}" || true
+    return 1
+  fi
+  if ! current_build_is_main "$data"; then
+    log "new build did not take over the profile; rolling back"
     rollback_previous "$data" "$dest" "$prev" "$port" "$dest/fingerprint" "${args[@]}" || true
     return 1
   fi
