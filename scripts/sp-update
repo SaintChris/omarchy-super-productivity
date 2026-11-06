@@ -7,9 +7,13 @@
 # The delivery folder (SP_UPDATE_HOST, SP_UPDATE_DIR) holds latest.txt, latest.sha256 and the
 # AppImage, as `sp-fetch` describes. A newer build is downloaded and checked at once. Installing
 # waits until the desktop has been idle, or until shortly after login, and it happens in one run:
-# quit the app, back up the profile, `sp-launch install`, start it, and check the local API.
-# The backup is what a rollback restores, together with the previous unpacked version, so it is
-# taken after the app has quit and immediately before the new version is installed.
+# read the current build's API, quit the app, back up the profile, `sp-launch install`, start it,
+# and check the local API again. The before-state is that API. When the app is not already
+# running, the current build is started on the real profile, the same way a login start does.
+# The newest JSON backup is a second check: install does not proceed when it lists a project or
+# task the API does not. A new start counts only when the profile lock's executable is inside
+# the unpacked folder `current` names. Rollback restores the backup and the previous unpacked
+# version, and reports the data restored only when the restarted app's API matches the before-state.
 #
 # Settings come from the environment or from SP_UPDATE_CONFIG (default ~/.config/sp-update/config),
 # a KEY=value file. The ntfy topic is the contents of SP_UPDATE_NTFY_TOPIC_FILE, never this script.
@@ -204,33 +208,87 @@ should_apply() {
   return 1
 }
 
-# Print pids whose argv0 is superproductivity-bin and whose --user-data-dir matches.
-# With "main", skip helper processes (--type=).
+# Executable name, with a deleted-file suffix removed. Empty when the process is gone.
+exe_base() {
+  local exe
+  exe=$(readlink "/proc/$1/exe" 2>/dev/null || true)
+  exe=${exe%' (deleted)'}
+  basename -- "$exe"
+}
+
+# Chromium rewrites helper command lines into one space-joined string.
+cmdline_joined() {
+  tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null || true
+}
+
+is_helper_pid() {
+  local joined
+  joined=$(cmdline_joined "$1")
+  [[ $joined == *"--type="* ]]
+}
+
+# SingletonLock points at "<host>-<pid>". The pid is the integer after the last "-".
+singleton_pid() {
+  local target
+  [[ -L $1/SingletonLock ]] || return 1
+  target=$(readlink -- "$1/SingletonLock") || return 1
+  [[ $target =~ -([0-9]+)$ ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+# argv0 is superproductivity-bin and a separate --user-data-dir argument matches.
+legacy_profile_pid() {
+  local pid=$1 data=$2 cmd0 base dir arg
+  [[ -r /proc/$pid/cmdline ]] || return 1
+  cmd0=
+  IFS= read -r -d '' cmd0 <"/proc/$pid/cmdline" || true
+  [[ -n $cmd0 ]] || return 1
+  base=$(basename -- "$cmd0")
+  [[ $base == superproductivity-bin ]] || return 1
+  dir=
+  while IFS= read -r -d '' arg || [[ -n $arg ]]; do
+    case $arg in
+      --user-data-dir=*) dir=${arg#--user-data-dir=} ;;
+    esac
+  done <"/proc/$pid/cmdline"
+  [[ $dir == "$data" ]]
+}
+
+# The executable is superproductivity* and the joined command line names this profile.
+exe_profile_pid() {
+  local pid=$1 data=$2 joined base
+  base=$(exe_base "$pid")
+  [[ $base == superproductivity* ]] || return 1
+  joined=$(cmdline_joined "$pid")
+  [[ $joined == *"--user-data-dir=${data}"* ]]
+}
+
+# Print pids for this profile. With "main", skip helper processes (--type=).
+# Electron rewrites the main process command line into one string and drops
+# --user-data-dir, so argv0 is not enough. The profile's SingletonLock names
+# that process when its executable starts with superproductivity.
 matching_pids() {
-  local data=$1 mode=${2:-all} pid_path pid cmd0 base dir arg
+  local data=$1 mode=${2:-all} pid_path pid lock seen=" "
   [[ -n $data ]] || return 0
+  if lock=$(singleton_pid "$data") && [[ -d /proc/$lock ]] && [[ $(exe_base "$lock") == superproductivity* ]]; then
+    if [[ $mode != main ]] || ! is_helper_pid "$lock"; then
+      seen+="$lock "
+      printf '%s\n' "$lock"
+    fi
+  fi
   for pid_path in /proc/[0-9]*; do
     pid=${pid_path#/proc/}
+    case $seen in
+      *" $pid "*) continue ;;
+    esac
     [[ -r $pid_path/cmdline ]] || continue
-    cmd0=
-    IFS= read -r -d '' cmd0 <"$pid_path/cmdline" || true
-    [[ -n $cmd0 ]] || continue
-    base=$(basename "$cmd0")
-    [[ $base == superproductivity-bin ]] || continue
-    dir=
-    while IFS= read -r -d '' arg || [[ -n $arg ]]; do
-      case $arg in
-        --user-data-dir=*) dir=${arg#--user-data-dir=} ;;
-      esac
-    done <"$pid_path/cmdline"
-    [[ $dir == "$data" ]] || continue
-    if [[ $mode == main ]]; then
-      local typed=0
-      while IFS= read -r -d '' arg || [[ -n $arg ]]; do
-        [[ $arg == --type=* ]] && typed=1
-      done <"$pid_path/cmdline"
-      [[ $typed == 0 ]] || continue
+    if ! legacy_profile_pid "$pid" "$data" && ! exe_profile_pid "$pid" "$data"; then
+      continue
     fi
+    if [[ $mode == main ]] && is_helper_pid "$pid"; then
+      continue
+    fi
+    seen+="$pid "
     printf '%s\n' "$pid"
   done
 }
@@ -257,6 +315,14 @@ read_start_args() {
     _out+=("$arg")
   done <"/proc/$pid/cmdline"
   [[ $(basename "$cmd0") == superproductivity-bin ]] || return 1
+}
+
+port_from_pid() {
+  local joined
+  [[ -r /proc/$1/cmdline ]] || return 1
+  joined=$(cmdline_joined "$1")
+  [[ $joined =~ --rest-api-port=([0-9]+) ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
 }
 
 args_match_data() {
@@ -306,26 +372,13 @@ auth_header() {
 }
 
 write_fingerprint() {
-  # write_fingerprint <outfile> <mode> <json-file> reads an API body or an app backup.
+  # write_fingerprint <outfile> <projects|tasks> <api-json>
   local outfile=$1 mode=$2 infile=$3
+  [[ $mode == projects || $mode == tasks ]] || return 1
   [[ -s $infile ]] || return 1
   python3 - "$outfile" "$mode" "$infile" <<'PY'
 import json, sys
 outfile, mode, infile = sys.argv[1], sys.argv[2], sys.argv[3]
-
-def as_ids(node):
-    if isinstance(node, dict) and isinstance(node.get("ids"), list):
-        return [str(i) for i in node["ids"]]
-    return []
-
-def from_backup(doc):
-    tasks = as_ids(doc.get("task"))
-    for key in ("archiveYoung", "archiveOld"):
-        arch = doc.get(key) or {}
-        if isinstance(arch, dict):
-            tasks += as_ids(arch.get("task"))
-    projects = as_ids(doc.get("project"))
-    return projects, tasks
 
 def from_api(doc):
     data = doc.get("data", doc) if isinstance(doc, dict) else doc
@@ -337,32 +390,11 @@ def from_api(doc):
     return ids
 
 with open(infile, encoding="utf-8") as handle:
-    raw = json.load(handle)
-if mode == "backup":
-    projects, tasks = from_backup(raw)
-    label = "superset"
-elif mode == "projects":
-    projects, tasks = from_api(raw), None
-    label = None
-else:
-    projects, tasks = None, from_api(raw)
-    label = None
-
-if label is None:
-    kind = "project" if mode == "projects" else "task"
-    values = projects if mode == "projects" else tasks
-    with open(outfile, "a", encoding="utf-8") as out:
-        for value in sorted(set(values)):
-            out.write(f"{kind} {value}\n")
-else:
-    if not projects or not tasks:
-        sys.exit(1)
-    with open(outfile, "w", encoding="utf-8") as out:
-        out.write(f"mode {label}\n")
-        for value in sorted(set(projects)):
-            out.write(f"project {value}\n")
-        for value in sorted(set(tasks)):
-            out.write(f"task {value}\n")
+    values = from_api(json.load(handle))
+kind = "project" if mode == "projects" else "task"
+with open(outfile, "a", encoding="utf-8") as out:
+    for value in sorted(set(values)):
+        out.write(f"{kind} {value}\n")
 PY
 }
 
@@ -380,12 +412,6 @@ snapshot_api() {
   write_fingerprint "$outfile" tasks "$body" || return 1
   grep -q '^project ' "$outfile" || return 1
   grep -q '^task ' "$outfile" || return 1
-}
-
-fingerprint_from_backup() {
-  local json=$1 outfile=$2
-  [[ -s $json ]] || return 1
-  write_fingerprint "$outfile" backup "$json"
 }
 
 fingerprints_match() {
@@ -451,8 +477,31 @@ latest_backup_json() {
   printf '%s\n' "$path"
 }
 
+copy_profile_contents() {
+  local data=$1 dest=$2 entry name rc
+  [[ -n $data && $data != / && -d $data ]] || return 1
+  [[ -n $dest && $dest != / ]] || return 1
+  mkdir -p -- "$dest"
+  chmod 700 "$dest"
+  shopt -s dotglob nullglob
+  rc=0
+  for entry in "$data"/*; do
+    name=$(basename "$entry")
+    if is_ephemeral "$name"; then
+      continue
+    fi
+    if ! cp -a "$entry" "$dest/"; then
+      rc=1
+      break
+    fi
+  done
+  shopt -u dotglob nullglob
+  [[ $rc == 0 ]] || return 1
+  [[ -d $dest/IndexedDB || -d $dest/backups ]]
+}
+
 backup_profile() {
-  local data=$1 dest=$2 entry name latest rc
+  local data=$1 dest=$2 latest
   [[ -n $data && $data != / && -d $data ]] || return 1
   [[ -n $dest && $dest != / ]] || return 1
   mkdir -p -- "$dest"
@@ -462,21 +511,7 @@ backup_profile() {
   else
     chmod 700 "$dest/profile"
   fi
-  shopt -s dotglob nullglob
-  rc=0
-  for entry in "$data"/*; do
-    name=$(basename "$entry")
-    if is_ephemeral "$name"; then
-      continue
-    fi
-    if ! cp -a "$entry" "$dest/profile/"; then
-      rc=1
-      break
-    fi
-  done
-  shopt -u dotglob nullglob
-  [[ $rc == 0 ]] || return 1
-  [[ -d $dest/profile/IndexedDB || -d $dest/profile/backups ]] || return 1
+  copy_profile_contents "$data" "$dest/profile" || return 1
   latest=$(latest_backup_json "$data") || return 1
   cp -a "$latest" "$dest/app-backup.json" || return 1
   cmp -s "$latest" "$dest/app-backup.json"
@@ -643,8 +678,113 @@ notify_once() {
 
 short_commit() { printf '%.10s\n' "$REMOTE_COMMIT"; }
 
+# Exit 0 when every JSON id is in the fingerprint. Extra API ids are allowed.
+# Exit 1 when the API is missing an id. Exit 2 when the JSON has no project or no task.
+json_ids_in_fingerprint() {
+  local json=$1 fp=$2
+  [[ -s $json && -s $fp ]] || return 2
+  python3 - "$json" "$fp" <<'PY'
+import json, sys
+
+def as_ids(node):
+    if isinstance(node, dict) and isinstance(node.get("ids"), list):
+        return [str(i) for i in node["ids"]]
+    return []
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    doc = json.load(handle)
+projects = set(as_ids(doc.get("project")))
+tasks = set(as_ids(doc.get("task")))
+for key in ("archiveYoung", "archiveOld"):
+    arch = doc.get(key) or {}
+    if isinstance(arch, dict):
+        tasks.update(as_ids(arch.get("task")))
+if not projects or not tasks:
+    print("backup has no projects or tasks")
+    sys.exit(2)
+fp_projects, fp_tasks = set(), set()
+with open(sys.argv[2], encoding="utf-8") as handle:
+    for line in handle:
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        if parts[0] == "project":
+            fp_projects.add(parts[1])
+        elif parts[0] == "task":
+            fp_tasks.add(parts[1])
+print(
+    f"backup projects {len(projects)} tasks {len(tasks)}; "
+    f"app projects {len(fp_projects)} tasks {len(fp_tasks)}"
+)
+if projects - fp_projects or tasks - fp_tasks:
+    sys.exit(1)
+PY
+}
+
+# Refuse the install when the newest JSON lists something the API does not have.
+# An absent JSON is left for backup_profile to reject. The app is not quit here.
+require_backup_ids() {
+  local data=$1 fp=$2 json rc
+  json=$(latest_backup_json "$data" || true)
+  [[ -n $json ]] || return 0
+  rc=0
+  json_ids_in_fingerprint "$json" "$fp" || rc=$?
+  if [[ $rc == 0 ]]; then
+    return 0
+  fi
+  if [[ $rc == 2 ]]; then
+    notify_once "backup-$REMOTE_SHA" "Update skipped. The data backup failed, so nothing was installed." skip
+    return 1
+  fi
+  log "latest backup lists projects or tasks the app does not have; not installing"
+  notify_once "data-$REMOTE_SHA" "Update skipped. The app is missing projects or tasks that the latest backup lists, so nothing was installed."
+  return 1
+}
+
+# The profile lock must name a live process whose executable is inside the
+# unpacked folder `current` points at. A second instance exits 0 and leaves
+# the previous build holding the lock.
+current_build_is_main() {
+  local data=$1 root ver pid exe
+  root=$(launch_root)
+  ver=$(current_version) || return 1
+  pid=$(singleton_pid "$data") || return 1
+  [[ -d /proc/$pid ]] || return 1
+  exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+  exe=${exe%' (deleted)'}
+  [[ -n $exe && $exe == "$root/versions/$ver/"* ]]
+}
+
+# Put the previous version and the profile backup back. Report the data
+# restored only when that version's API matches the before-state.
+rollback_previous() {
+  local data=$1 dest=$2 prev=$3 port=$4 fingerprint=$5
+  shift 5
+  local state
+  state=$(state_dir)
+  stop_matching "$data" force || true
+  if [[ -n $prev ]]; then
+    point_current "$prev"
+  fi
+  if ! restore_profile "$dest" "$data"; then
+    log "could not restore the profile"
+    notify_once "rollback-$REMOTE_SHA" "Update failed. The previous version was put back, but the profile copy could not be restored."
+    return 1
+  fi
+  if start_main "$@" \
+    && wait_health "$port" \
+    && snapshot_api "$data" "$port" "$state/running-fingerprint" \
+    && fingerprints_match "$fingerprint" "$state/running-fingerprint"; then
+    notify_once "rollback-$REMOTE_SHA" "Update failed. The previous version is running and the data backup was restored."
+  else
+    log "restored profile does not serve the backed-up data"
+    notify_once "rollback-$REMOTE_SHA" "Update failed. The previous version was put back, but the running data does not match the backup."
+  fi
+  return 1
+}
+
 apply_update() {
-  local data state dest stamp prev port was_running file root
+  local data state dest stamp prev port was_running file root live live_port
   local -a args=()
   data=${SP_UPDATE_DATA_DIR:-}
   [[ -n $data && -d $data ]] || {
@@ -655,10 +795,14 @@ apply_update() {
   was_running=0
   if main_pid "$data" >/dev/null; then
     was_running=1
-    read_start_args "$data" args || {
-      log "could not read the running app's arguments; not installing"
-      return 1
-    }
+    if ! read_start_args "$data" args; then
+      if [[ -n ${SP_UPDATE_START_ARGS:-} ]]; then
+        read -r -a args <<<"$SP_UPDATE_START_ARGS"
+      else
+        log "could not read the running app's arguments; not installing"
+        return 1
+      fi
+    fi
   else
     [[ -n ${SP_UPDATE_START_ARGS:-} ]] || {
       log "app is not running and no start arguments are set; not installing"
@@ -674,10 +818,26 @@ apply_update() {
     log "no REST API port in the start arguments; not installing"
     return 1
   }
+  if [[ $was_running == 1 ]]; then
+    live=$(main_pid "$data" || true)
+    if [[ -n $live ]] && live_port=$(port_from_pid "$live"); then
+      port=$live_port
+    fi
+  fi
   [[ -f $data/local-rest-api-token ]] || {
     log "profile has no API token; not installing"
     return 1
   }
+
+  # Nothing is running: start the current build on the real profile, the same
+  # way a login start does, then read its API. Do not start a second copy.
+  if [[ $was_running == 0 ]]; then
+    if ! start_main "${args[@]}" || ! wait_health "$port"; then
+      notify_once "no-api-$REMOTE_SHA" "Update skipped. The app did not answer a status check, so nothing was installed." skip
+      return 1
+    fi
+    was_running=1
+  fi
 
   if [[ $was_running == 1 ]]; then
     if ! in_login_window && ! desktop_idle; then
@@ -686,6 +846,9 @@ apply_update() {
     fi
     if ! api_up "$port" || ! snapshot_api "$data" "$port" "$state/pending-fingerprint"; then
       notify_once "no-api-$REMOTE_SHA" "Update skipped. The app did not answer a status check, so nothing was installed." skip
+      return 1
+    fi
+    if ! require_backup_ids "$data" "$state/pending-fingerprint"; then
       return 1
     fi
     if ! stop_matching "$data"; then
@@ -704,13 +867,7 @@ apply_update() {
     fi
     return 1
   fi
-  if [[ $was_running == 1 ]]; then
-    cp -a "$state/pending-fingerprint" "$dest/fingerprint"
-  elif ! fingerprint_from_backup "$dest/app-backup.json" "$dest/fingerprint"; then
-    rm -rf "$dest"
-    notify_once "backup-$REMOTE_SHA" "Update skipped. The data backup failed, so nothing was installed." skip
-    return 1
-  fi
+  cp -a "$state/pending-fingerprint" "$dest/fingerprint"
   {
     printf 'commit %s\n' "$REMOTE_COMMIT"
     printf 'built %s\n' "$REMOTE_BUILT"
@@ -739,20 +896,18 @@ apply_update() {
   fi
 
   if ! start_main "${args[@]}"; then
-    stop_matching "$data" force || true
-    [[ -n $prev ]] && point_current "$prev"
-    restore_profile "$dest" "$data" || log "could not restore the profile"
-    start_main "${args[@]}" || true
-    notify_once "rollback-$REMOTE_SHA" "Update failed. The previous version is running and the data backup was restored."
+    log "new build did not start; rolling back"
+    rollback_previous "$data" "$dest" "$prev" "$port" "$dest/fingerprint" "${args[@]}" || true
+    return 1
+  fi
+  if ! current_build_is_main "$data"; then
+    log "new build did not take over the profile; rolling back"
+    rollback_previous "$data" "$dest" "$prev" "$port" "$dest/fingerprint" "${args[@]}" || true
     return 1
   fi
   if ! wait_health "$port" || ! snapshot_api "$data" "$port" "$state/running-fingerprint" || ! fingerprints_match "$dest/fingerprint" "$state/running-fingerprint"; then
     log "new build did not come up with the same data; rolling back"
-    stop_matching "$data" force || true
-    [[ -n $prev ]] && point_current "$prev"
-    restore_profile "$dest" "$data" || log "could not restore the profile"
-    start_main "${args[@]}" || true
-    notify_once "rollback-$REMOTE_SHA" "Update failed. The previous version is running and the data backup was restored."
+    rollback_previous "$data" "$dest" "$prev" "$port" "$dest/fingerprint" "${args[@]}" || true
     return 1
   fi
   printf '%s %s\n' "$REMOTE_SHA" "$REMOTE_BUILT" >"$state/applied"

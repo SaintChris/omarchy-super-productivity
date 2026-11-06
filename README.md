@@ -90,9 +90,11 @@ The folder holds the AppImage (`superProductivity-arm64-<commit>.AppImage`), `la
 
 `scripts/sp-update` is the unattended form of `sp-fetch`. A systemd user timer runs it at 08:00, 14:00 and 20:00 local time, and again two minutes after login. A newer AppImage is downloaded and checked against its sha256 as soon as the timer runs. That download does not change which version launches. `current` stays put until a later run both installs and starts the new build.
 
-That run waits until the desktop has been idle, or until the session is still in its first minutes after login. It then does the switch in one go: quit Super Productivity, back up the profile, `sp-launch install`, start the app, and check that the local API on `127.0.0.1` is up and the same projects and tasks are present. The backup is taken after the app has quit, because that is the copy a rollback restores. An overnight reboot keeps running the version already installed.
+That run waits until the desktop has been idle, or until the session is still in its first minutes after login. It then does the switch in one go: read the current build's local API, quit Super Productivity, back up the profile, `sp-launch install`, start the app, and check that the API on `127.0.0.1` is up and the same projects and tasks are present. The backup is taken after the app has quit, because that is the copy a rollback restores. An overnight reboot keeps running the version already installed.
 
-The backup is the profile directory without the browser caches, plus the newest `backups/*.json` the app wrote. Five dated copies are kept. If the backup fails, nothing is installed. If the new version does not come up, or projects or tasks are missing, `sp-update` points `current` back at the previous version, restores that backup and starts the previous version. Sync settings are copied with the profile and are not edited.
+The before-state is that API snapshot. Electron rewrites the main process command line into one string and drops `--user-data-dir`, so a running profile is the pid in its `SingletonLock` symlink (`<host>-<pid>`) when that process's executable starts with `superproductivity`. When the app is not already running, the current build is started on that same profile, the same way a login start does, and the API is read there. The script does not start a second copy of the profile. The newest `backups/*.json` is not the before-state. If it lists a project or task the API does not have, nothing is installed and a running app is left up.
+
+The backup is the profile directory without the browser caches, plus that newest JSON file. Five dated copies are kept. If the backup fails, or the current app does not answer the API, nothing is installed. If the new version does not come up, or the profile lock still names another build, or projects or tasks are missing, `sp-update` points `current` back at the previous version, restores that backup and starts the previous version. A new start counts only when `SingletonLock`'s executable is inside the unpacked folder `current` names. A start that exits because another instance is already running is a failed start, and the install is not recorded. It reports that the data backup was restored only when that restarted app's API matches the snapshot taken before the install. Sync settings are copied with the profile and are not edited.
 
 Each install, skipped install or failure sends one ntfy message. The topic is the contents of the file named by `SP_UPDATE_NTFY_TOPIC_FILE`. It is not stored in this repo. Set `SP_UPDATE_NTFY_SINK` to a path to record the message locally instead of sending it. A missed run while the machine was asleep happens the next time the timer starts. The timer does not hold up login. The first start can catch up a calendar slot that already passed; that run still installs only when the desktop is idle or the session just started.
 
@@ -111,7 +113,7 @@ SP_UPDATE_NTFY_TOPIC_FILE=$HOME/.config/sp-update/ntfy-topic
 SP_UPDATE_START_ARGS=--user-data-dir=$HOME/.config/sp-work --rest-api-port=3876
 ```
 
-`SP_UPDATE_START_ARGS` is used when the app is not running, and it has to name the same profile as `SP_UPDATE_DATA_DIR`. When the app is running, the arguments of that process are used instead.
+`SP_UPDATE_START_ARGS` is used when the app is not running, and when the running process's arguments cannot be read. It has to name the same profile as `SP_UPDATE_DATA_DIR`. When those arguments are readable, they are used instead.
 
 ```bash
 systemctl --user daemon-reload

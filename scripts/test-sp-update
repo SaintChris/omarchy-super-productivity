@@ -42,14 +42,22 @@ fail() {
 }
 
 capture_live() {
-  local pid_path pid cmd0
+  local pid_path pid exe base joined cmd0
   for pid_path in /proc/[0-9]*; do
     pid=${pid_path#/proc/}
     [[ -r $pid_path/cmdline ]] || continue
+    exe=$(readlink "$pid_path/exe" 2>/dev/null || true)
+    exe=${exe%' (deleted)'}
+    base=$(basename -- "$exe")
+    joined=$(tr '\0' ' ' <"$pid_path/cmdline" 2>/dev/null || true)
+    if [[ $base == superproductivity* && $joined != *"--type="* ]]; then
+      live_pids+=("$pid")
+      continue
+    fi
     cmd0=
     IFS= read -r -d '' cmd0 <"$pid_path/cmdline" || true
     [[ -n $cmd0 ]] || continue
-    [[ $(basename "$cmd0") == superproductivity-bin ]] || continue
+    [[ $(basename -- "$cmd0") == superproductivity-bin ]] || continue
     live_pids+=("$pid")
   done
   if [[ -L $HOME/.local/share/sp-launch/current ]]; then
@@ -58,12 +66,18 @@ capture_live() {
 }
 
 verify_live() {
-  local pid cmd0
+  local pid exe base cmd0
   for pid in "${live_pids[@]}"; do
-    [[ -r /proc/$pid/cmdline ]] || return 1
+    [[ -d /proc/$pid ]] || return 1
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+    exe=${exe%' (deleted)'}
+    base=$(basename -- "$exe")
+    if [[ $base == superproductivity* ]]; then
+      continue
+    fi
     cmd0=
     IFS= read -r -d '' cmd0 <"/proc/$pid/cmdline" || true
-    [[ $(basename "$cmd0") == superproductivity-bin ]] || return 1
+    [[ $(basename -- "$cmd0") == superproductivity-bin ]] || return 1
   done
   if [[ -n $real_link ]]; then
     [[ $(readlink "$HOME/.local/share/sp-launch/current") == "$real_link" ]] || return 1
@@ -71,7 +85,7 @@ verify_live() {
 }
 
 kill_fakes() {
-  local pid cmd skip live
+  local pid cmd exe skip live
   [[ -f $FAKE_PIDS ]] || return 0
   while IFS= read -r pid; do
     [[ $pid =~ ^[0-9]+$ ]] || continue
@@ -83,6 +97,13 @@ kill_fakes() {
       fi
     done
     [[ $skip == 0 ]] || continue
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+    case $exe in
+      "$WORKDIR"/*)
+        kill -KILL "$pid" 2>/dev/null || true
+        continue
+        ;;
+    esac
     cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline")
     case $cmd in
       superproductivity-bin*"$WORKDIR"*) kill -KILL "$pid" 2>/dev/null || true ;;
@@ -164,22 +185,66 @@ case $cmd in
       shift
     fi
     printf 'start\n' >>"${FAKE_LOG:?}"
+    ud=
+    rp=9
+    for arg in "$@"; do
+      case $arg in
+        --user-data-dir=*)
+          ud=${arg#--user-data-dir=}
+          printf 'start-ud %s\n' "$ud" >>"${FAKE_LOG:?}"
+          ;;
+        --rest-api-port=*) rp=${arg#--rest-api-port=} ;;
+      esac
+    done
+    [[ -n $ud ]] || exit 1
     ver=$(basename "$(readlink "$root/current")")
-    if [[ $ver != "${OLD_VERSION:?}" ]]; then
-      printf 'after\n' >"${SP_UPDATE_DATA_DIR:?}/profile-marker"
-      mkdir -p "${SP_UPDATE_DATA_DIR}/Migration"
-      printf 'new\n' >"${SP_UPDATE_DATA_DIR}/Migration/state"
+    launch_ver=$ver
+    # A handoff exits 0 while the previous build keeps the profile lock.
+    if [[ ${FAKE_STALE_LOCK:-} == yes && $ver != "${OLD_VERSION:?}" ]]; then
+      printf 'handoff\n' >>"${FAKE_LOG:?}"
+      launch_ver=$OLD_VERSION
+    elif [[ $ver != "${OLD_VERSION:?}" ]]; then
+      printf 'after\n' >"$ud/profile-marker"
+      mkdir -p "$ud/Migration"
+      printf 'new\n' >"$ud/Migration/state"
+    fi
+    bin="$root/versions/$launch_ver/superproductivity-bin"
+    if [[ ! -x $bin ]]; then
+      cp -a "$(readlink -f /usr/bin/python3)" "$bin"
+      chmod 755 "$bin"
     fi
     code='import time; time.sleep(3600)'
-    python3 -c 'import os, sys
+    python3 -c 'import os, sys, time
+ud, code, pids, port, binpath = sys.argv[1:6]
 pid = os.fork()
-if pid > 0:
-    with open(sys.argv[3], "a", encoding="utf-8") as handle:
-        handle.write(str(pid) + "\n")
-    os._exit(0)
-os.setsid()
-os.execv("/usr/bin/python3", ["superproductivity-bin", "-c", sys.argv[2], "--user-data-dir=" + sys.argv[1], "--rest-api-port=9"])' \
-      "$SP_UPDATE_DATA_DIR" "$code" "${FAKE_PIDS:?}"
+if pid == 0:
+    os.setsid()
+    os.execv(binpath, ["superproductivity-bin", "-c", code, "--user-data-dir=" + ud, "--rest-api-port=" + port])
+    os._exit(127)
+deadline = time.time() + 2
+while time.time() < deadline:
+    try:
+        exe = os.readlink("/proc/%d/exe" % pid)
+    except OSError:
+        exe = ""
+    if exe.startswith(binpath):
+        break
+    time.sleep(0.05)
+else:
+    os._exit(1)
+lock = os.path.join(ud, "SingletonLock")
+tmp = lock + ".new"
+try:
+    os.unlink(tmp)
+except OSError:
+    pass
+os.symlink("probehost-%d" % pid, tmp)
+os.replace(tmp, lock)
+handle = open(pids, "a", encoding="utf-8")
+handle.write("%d\n" % pid)
+handle.close()
+os._exit(0)' \
+      "$ud" "$code" "${FAKE_PIDS:?}" "$rp" "$bin"
     ;;
   *)
     printf 'unknown %s\n' "$cmd" >&2
@@ -227,10 +292,26 @@ case $path in
     body=ok
     ;;
   /projects)
-    body='{"ok":true,"data":[{"id":"p1"}]}'
+    if [[ -n ${FAKE_PROJECTS_JSON:-} ]]; then
+      body=$FAKE_PROJECTS_JSON
+    else
+      body='{"ok":true,"data":[{"id":"p1"}]}'
+    fi
     ;;
   /tasks\?*)
-    body='{"ok":true,"data":[{"id":"t1"},{"id":"t2"}]}'
+    n=0
+    if [[ -n ${FAKE_TASK_COUNT_FILE:-} ]]; then
+      n=$(cat "${FAKE_TASK_COUNT_FILE}" 2>/dev/null || echo 0)
+      n=$((n + 1))
+      printf '%s\n' "$n" >"${FAKE_TASK_COUNT_FILE}"
+    fi
+    if [[ -n ${FAKE_DEGRADE_AFTER:-} && $n -gt ${FAKE_DEGRADE_AFTER} ]]; then
+      body='{"ok":true,"data":[{"id":"t1"}]}'
+    elif [[ -n ${FAKE_TASKS_JSON:-} ]]; then
+      body=$FAKE_TASKS_JSON
+    else
+      body='{"ok":true,"data":[{"id":"t1"},{"id":"t2"}]}'
+    fi
     ;;
   *)
     exit 1
@@ -293,7 +374,8 @@ setup_case() {
   export FAKE_PIDS
   export FAKE_IDLE=no
   export OLD_VERSION
-  unset FAKE_HEALTH
+  unset FAKE_HEALTH FAKE_TASKS_JSON FAKE_PROJECTS_JSON FAKE_DEGRADE_AFTER FAKE_TASK_COUNT_FILE
+  unset FAKE_STALE_LOCK
   unset SP_UPDATE_NTFY_TOPIC_FILE
 }
 
@@ -366,6 +448,26 @@ assert_sync_kept() {
   cmp -s "$CASE/sync-orig" "$DATA/sync-marker" || fail "live sync marker changed"
 }
 
+assert_only_profile_dir() {
+  local line dir n=0
+  [[ -f $FAKE_LOG ]] || fail "no launch log"
+  while IFS= read -r line; do
+    [[ $line == start-ud\ * ]] || continue
+    dir=${line#start-ud }
+    n=$((n + 1))
+    [[ $dir == "$DATA" ]] || fail "start used another profile: $dir"
+  done <"$FAKE_LOG"
+  [[ $n -ge 1 ]] || fail "no profile was started"
+}
+
+assert_lock_exe_under() {
+  local ver=$1 pid exe
+  pid=$(main_pid "$DATA") || fail "profile lock has no live process"
+  exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+  exe=${exe%' (deleted)'}
+  [[ $exe == "$LAUNCH/versions/$ver/"* ]] || fail "lock exe $exe is not under $ver"
+}
+
 one_backup() {
   local dir n=0 found=
   for dir in "$STATE/backups"/*; do
@@ -416,6 +518,43 @@ os.execv("/usr/bin/python3", ["superproductivity-bin", "-c", sys.argv[2], "--use
 
 assert_marker() {
   grep -qx "$1" "$DATA/profile-marker" || fail "profile marker is not $1"
+}
+
+spawn_hidden_app() {
+  local bin pid i exe
+  case $DATA in
+    "$WORKDIR"/*) ;;
+    *) fail "refusing to spawn outside the work dir" ;;
+  esac
+  bin=$CASE/superproductivity-bin
+  if [[ ! -x $bin ]]; then
+    cp -a "$(readlink -f /usr/bin/python3)" "$bin"
+    chmod 755 "$bin"
+  fi
+  python3 -c 'import os, sys
+pid = os.fork()
+if pid > 0:
+    with open(sys.argv[2], "a", encoding="utf-8") as handle:
+        handle.write(str(pid) + "\n")
+    os._exit(0)
+os.setsid()
+os.execv(sys.argv[1], ["superProductivity --rest-api-port=9 --start-minimized", "-c", "import time; time.sleep(3600)"])' \
+    "$bin" "$FAKE_PIDS"
+  pid=$(awk 'END { print }' "$FAKE_PIDS")
+  ln -sfn "probehost-$pid" "$DATA/SingletonLock"
+  i=0
+  while [[ $i -lt 50 ]]; do
+    if [[ -d /proc/$pid ]]; then
+      exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+      if [[ $(basename -- "$exe") == superproductivity-bin ]]; then
+        SPAWNED=$pid
+        return 0
+      fi
+    fi
+    i=$((i + 1))
+    sleep 0.05
+  done
+  fail "hidden app did not start"
 }
 
 assert_no_complete() {
@@ -527,6 +666,8 @@ test_idle_install() {
   assert_ntfy 3 "Installed $COMMIT."
   assert_messages 1
   grep -F -q 'projects 1->1 tasks 2->2' "$CASE/out" || fail "fingerprint counts missing"
+  assert_lock_exe_under "$NEW_VER"
+  assert_only_profile_dir
 }
 
 test_login_install() {
@@ -545,6 +686,59 @@ test_login_install() {
   [[ ! -e $bak/profile/Cache ]] || fail "login backup copied cache"
   cmp -s "$CASE/json-orig" "$bak/app-backup.json" || fail "login backup json differs"
   assert_ntfy 3 "Installed $COMMIT."
+  assert_messages 1
+  assert_lock_exe_under "$NEW_VER"
+  assert_only_profile_dir
+}
+
+test_stopped_real_profile() {
+  local bak
+  setup_case
+  export FAKE_IDLE=yes
+  run_update
+  assert_status 0
+  assert_current "$NEW_VER"
+  assert_lock_exe_under "$NEW_VER"
+  assert_only_profile_dir
+  grep -F -x -q "start-ud $DATA" "$FAKE_LOG" || fail "real profile was not started"
+  bak=$(one_backup)
+  grep -qx 'mode exact' "$bak/fingerprint" || fail "before-state was not an API snapshot"
+  grep -qx before "$bak/profile/profile-marker" || fail "backup was taken after the new version started"
+  assert_marker after
+  if find "$STATE" -type d -name 'probe.*' -print -quit | grep -q .; then
+    fail "a throwaway profile was created"
+  fi
+  assert_ntfy 3 "Installed $COMMIT."
+}
+
+test_no_second_data_dir() {
+  setup_case
+  export FAKE_IDLE=yes
+  run_update
+  assert_status 0
+  assert_only_profile_dir
+  assert_current "$NEW_VER"
+  if find "$STATE" "$DATA" -type d -name 'probe.*' -print -quit | grep -q .; then
+    fail "a throwaway profile was created"
+  fi
+}
+
+test_new_build_left_old_lock() {
+  setup_case
+  export FAKE_IDLE=yes
+  export FAKE_STALE_LOCK=yes
+  run_update
+  assert_status 1
+  assert_log '^handoff$'
+  grep -F -q 'new build did not take over the profile' "$CASE/out" || fail "expected takeover log"
+  [[ ! -f $STATE/applied ]] || fail "applied was written after a failed start"
+  assert_current "$OLD_VERSION"
+  assert_marker before
+  [[ ! -e $DATA/Migration ]] || fail "new version marker survived"
+  assert_sync_kept
+  assert_only_profile_dir
+  assert_lock_exe_under "$OLD_VERSION"
+  assert_ntfy 5 "Update failed. The previous version is running and the data backup was restored."
   assert_messages 1
 }
 
@@ -575,14 +769,17 @@ test_health_fail() {
   export FAKE_HEALTH=fail
   run_update
   assert_status 1
-  assert_ntfy 5 "Update failed. The previous version is running and the data backup was restored."
+  assert_ntfy 4 "Update skipped. The app did not answer a status check, so nothing was installed."
   assert_messages 1
+  assert_not_logged '^install '
   assert_current "$OLD_VERSION"
   assert_marker before
   assert_sync_kept
-  [[ ! -e $DATA/Migration ]] || fail "migration file survived rollback"
-  [[ -f $DATA/Cache/junk ]] || fail "cache was removed during rollback"
-  cmp -s "$CASE/json-orig" "$DATA/backups/2026-11-04_000000.json" || fail "restored json differs"
+  [[ ! -e $DATA/Migration ]] || fail "migration file was written"
+  [[ -f $DATA/Cache/junk ]] || fail "cache was removed"
+  assert_only_profile_dir
+  cmp -s "$CASE/json-orig" "$DATA/backups/2026-11-04_000000.json" || fail "json differs"
+  assert_no_complete
   kill_fakes
   run_update
   assert_status 1
@@ -673,6 +870,99 @@ test_prune() {
   fi
 }
 
+test_hidden_process_installs() {
+  local old bak
+  setup_case
+  export FAKE_IDLE=yes
+  spawn_hidden_app
+  old=$SPAWNED
+  run_update
+  assert_status 0
+  assert_current "$NEW_VER"
+  [[ ! -d /proc/$old ]] || fail "rewritten command line was left running"
+  bak=$(one_backup)
+  grep -qx 'mode exact' "$bak/fingerprint" || fail "before-state was not an API snapshot"
+  if grep -q '^mode superset$' "$bak/fingerprint"; then
+    fail "before-state came from the JSON backup"
+  fi
+  grep -qx 'task t1' "$bak/fingerprint" || fail "fingerprint missed t1"
+  grep -qx 'task t2' "$bak/fingerprint" || fail "fingerprint missed t2"
+  assert_marker after
+  assert_ntfy 3 "Installed $COMMIT."
+}
+
+test_hidden_backup_disagrees() {
+  local old
+  setup_case
+  export FAKE_IDLE=yes
+  printf '%s\n' '{"task":{"ids":["t1","t2","t3"]},"project":{"ids":["p1","p2"]}}' \
+    >"$DATA/backups/2026-11-04_000000.json"
+  spawn_hidden_app
+  old=$SPAWNED
+  run_update
+  assert_status 1
+  assert_ntfy 5 "Update skipped. The app is missing projects or tasks that the latest backup lists, so nothing was installed."
+  assert_messages 1
+  assert_not_logged '^install '
+  assert_current "$OLD_VERSION"
+  [[ -d /proc/$old ]] || fail "app was quit when the backup disagreed"
+  assert_marker before
+  assert_sync_kept
+  assert_no_complete
+}
+
+test_stopped_backup_disagrees() {
+  setup_case
+  export FAKE_IDLE=yes
+  printf '%s\n' '{"task":{"ids":["t1","t2","t3"]},"project":{"ids":["p1","p2"]}}' \
+    >"$DATA/backups/2026-11-04_000000.json"
+  run_update
+  assert_status 1
+  assert_ntfy 5 "Update skipped. The app is missing projects or tasks that the latest backup lists, so nothing was installed."
+  assert_messages 1
+  assert_not_logged '^install '
+  assert_current "$OLD_VERSION"
+  assert_marker before
+  assert_no_complete
+  main_pid "$DATA" >/dev/null || fail "app was quit when the backup disagreed"
+  assert_only_profile_dir
+}
+
+test_api_extra_ids_install() {
+  local bak
+  setup_case
+  export FAKE_IDLE=yes
+  export FAKE_TASKS_JSON='{"ok":true,"data":[{"id":"t1"},{"id":"t2"},{"id":"t3"}]}'
+  run_update
+  assert_status 0
+  assert_current "$NEW_VER"
+  bak=$(one_backup)
+  grep -qx 'mode exact' "$bak/fingerprint" || fail "before-state was not an API snapshot"
+  grep -qx 'task t3' "$bak/fingerprint" || fail "extra API task was dropped"
+  assert_ntfy 3 "Installed $COMMIT."
+}
+
+test_rollback_readback_fails() {
+  setup_case
+  export FAKE_IDLE=yes
+  export FAKE_DEGRADE_AFTER=1
+  export FAKE_TASK_COUNT_FILE=$CASE/task-reads
+  printf '0\n' >"$FAKE_TASK_COUNT_FILE"
+  run_update
+  assert_status 1
+  assert_log "^install $NEW_VER$"
+  assert_current "$OLD_VERSION"
+  assert_marker before
+  assert_sync_kept
+  [[ ! -e $DATA/Migration ]] || fail "migration file survived rollback"
+  cmp -s "$CASE/json-orig" "$DATA/backups/2026-11-04_000000.json" || fail "json file matches but that is not the data check"
+  assert_ntfy 5 "Update failed. The previous version was put back, but the running data does not match the backup."
+  if grep -q 'data backup was restored' "$SINK"; then
+    fail "restore was reported without an API match"
+  fi
+  assert_messages 1
+}
+
 test_backup_restore() {
   local dest
   setup_case
@@ -735,6 +1025,9 @@ test_check
 test_stage_busy
 test_idle_install
 test_login_install
+test_stopped_real_profile
+test_no_second_data_dir
+test_new_build_left_old_lock
 test_missing_json
 test_health_fail
 test_offline
@@ -742,6 +1035,11 @@ test_bad_listing
 test_bad_download
 test_no_quit
 test_empty_fingerprint
+test_hidden_process_installs
+test_hidden_backup_disagrees
+test_stopped_backup_disagrees
+test_api_extra_ids_install
+test_rollback_readback_fails
 test_prune
 test_backup_restore
 
